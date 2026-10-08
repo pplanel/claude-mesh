@@ -36,8 +36,6 @@ The airshell side: `~/Library/Logs/airshell-proxy.json`, e.g. `jq -r 'select(.fi
 - **Same session open on two Macs at once.** Both keep appending; the logs diverge and are merged as two branches. Claude resumes one branch; nothing is lost, but it's confusing. Use one Mac per session at a time, as with handoff.
 - **Local access.** The server binds `127.0.0.1` without auth: any process on this Mac can read the synced files through it. They are your own files under your account, already readable by those processes.
 - **Full rescans.** Each round lists the synced folders; unchanged files are hashed once and cached by (size, mtime).
-- **arrakis** is a company machine; see [setup](setup.md#before-you-start).
-
 ## Removing it
 
 On each Mac:

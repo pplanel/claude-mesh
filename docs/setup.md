@@ -7,7 +7,7 @@ Do steps 1–2 and 4–5 on **each** Mac (arrakis, caladan, imperium). Step 3 pa
 - **airshell-proxy with QUIC services and `[[forward]]` support** on every Mac (the build the term-llm hub uses; see airshell's `docs/howto/term-llm-hub-and-nodes.md`, step 1). Check: `launchctl print gui/$(id -u)/org.nixos.airshell-proxy | grep -m1 program`.
 - **Rust** (`cargo`), already on every Mac through nix-darwin.
 - **The repo on each Mac.** It isn't on GitHub yet; copy it or push it somewhere first.
-- **arrakis is the company machine.** Running a personal sync daemon there is your call; skip it there if policy says no. Two Macs are a valid mesh.
+- **You don't need all three Macs.** Any Mac can be left out; two Macs are a valid mesh.
 
 ## 1. Build
 
