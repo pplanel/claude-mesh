@@ -24,7 +24,7 @@ Today `claude-handoff` copies one session and its memory when you move it. `clau
 On **each** Mac (details and checks in [docs/setup.md](docs/setup.md)):
 
 ```sh
-cd ~/src/pplanel/crazy_project                 # arrakis; ~/src/crazy_project on caladan and imperium
+cd ~/src/pplanel/claude-mesh                 # arrakis; ~/src/claude-mesh on caladan and imperium
 cargo build --release
 ./target/release/claude-mesh airshell-config   # append its output to ~/.config/airshell/config.toml
 # authorize the other two Macs' airshell fingerprints (docs/setup.md, step 3)

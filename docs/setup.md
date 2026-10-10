@@ -6,13 +6,13 @@ Do steps 1–2 and 4–5 on **each** Mac (arrakis, caladan, imperium). Step 3 pa
 
 - **airshell-proxy with QUIC services and `[[forward]]` support** on every Mac (the build the term-llm hub uses; see airshell's `docs/howto/term-llm-hub-and-nodes.md`, step 1). Check: `launchctl print gui/$(id -u)/org.nixos.airshell-proxy | grep -m1 program`.
 - **Rust** (`cargo`), already on every Mac through nix-darwin.
-- **The repo on each Mac.** It isn't on GitHub yet; copy it or push it somewhere first.
+- **The repo on each Mac.** `src-sync` clones it from GitHub (`pplanel/claude-mesh`) into `~/src/pplanel/claude-mesh` on arrakis and `~/src/claude-mesh` elsewhere.
 - **You don't need all three Macs.** Any Mac can be left out; two Macs are a valid mesh.
 
 ## 1. Build
 
 ```sh
-cd ~/src/pplanel/crazy_project   # arrakis; ~/src/crazy_project on caladan and imperium
+cd ~/src/pplanel/claude-mesh   # arrakis; ~/src/claude-mesh on caladan and imperium
 cargo build --release
 ./target/release/claude-mesh status
 ```
