@@ -315,3 +315,46 @@ fn a_diverged_log_falls_back_to_the_whole_file() {
         assert_eq!(read(d, key), format!("{a}\n{b}\n{c}\n"), "{}", d.display());
     }
 }
+
+#[test]
+fn a_diverged_log_that_keeps_growing_still_comes_as_tails() {
+    // This session's case: a branch of it lives on caladan, while arrakis
+    // keeps writing its own (active, so it never merges caladan's in).
+    let mesh = start();
+    let key = "projects/-Users-pplanel/live.jsonl";
+    let line = |id: &str, ts: &str| {
+        format!(
+            r#"{{"uuid":"{id}","timestamp":"2026-10-11T10:{ts}:00Z","pad":"{}"}}"#,
+            "y".repeat(500)
+        )
+    };
+    write(&mesh.dirs[0], key, &format!("{}\n", line("a", "00")));
+    converge(&mesh);
+    let ab = format!("{}\n{}\n", line("a", "00"), line("b", "01"));
+    write(&mesh.dirs[0], key, &ab);
+    write(
+        &mesh.dirs[1],
+        key,
+        &format!("{}\n{}\n", line("a", "00"), line("c", "02")),
+    );
+    let once = |i: usize| {
+        let out = command(&mesh, i, &["once"]).output().unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    once(1); // caladan merges arrakis's branch in, and keeps arrakis's copy
+    // arrakis goes on writing, never pulling.
+    write(&mesh.dirs[0], key, &format!("{ab}{}\n", line("d", "03")));
+    let log = once(1);
+    let arrakis = log.lines().find(|l| l.contains("arrakis:")).unwrap_or("");
+    assert!(
+        arrakis.contains("(1 as tails)") && arrakis.contains("fetched 1 KiB"),
+        "{log}"
+    );
+    let got = read(&mesh.dirs[1], key);
+    for id in ["a", "b", "c", "d"] {
+        assert!(
+            got.contains(&format!(r#""uuid":"{id}""#)),
+            "{id} missing: {got}"
+        );
+    }
+}

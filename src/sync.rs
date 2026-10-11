@@ -86,6 +86,7 @@ pub fn sync_peer(
     conn: &mut Peer,
     scanner: &Scanner,
     state: &mut State,
+    peer_copies: &Path,
 ) -> std::io::Result<Report> {
     let remote: Manifest = serde_json::from_slice(&conn.request("manifest")?)
         .map_err(|e| std::io::Error::other(format!("bad manifest from {peer}: {e}")))?;
@@ -101,6 +102,7 @@ pub fn sync_peer(
         }
         let ours = local.get(rel);
         if ours.is_some_and(|o| o.hash == theirs.hash) {
+            forget_peer_copy(peer_copies, rel);
             seen.insert(rel.clone(), theirs.hash.clone());
             state.local.insert(rel.clone(), theirs.hash.clone());
             continue;
@@ -114,18 +116,19 @@ pub fn sync_peer(
             continue;
         }
 
-        let remote_bytes = match fetch_tail(conn, rel, ours.is_some(), scanner, theirs)? {
-            Some((bytes, tail_len)) => {
-                report.tails += 1;
-                report.fetched += tail_len as u64;
-                bytes
-            }
-            None => {
-                let bytes = conn.file(rel)?;
-                report.fetched += bytes.len() as u64;
-                bytes
-            }
-        };
+        let remote_bytes =
+            match fetch_tail(conn, rel, ours.is_some(), scanner, theirs, peer_copies)? {
+                Some((bytes, tail_len)) => {
+                    report.tails += 1;
+                    report.fetched += tail_len as u64;
+                    bytes
+                }
+                None => {
+                    let bytes = conn.file(rel)?;
+                    report.fetched += bytes.len() as u64;
+                    bytes
+                }
+            };
         if blake3::hash(&remote_bytes).to_hex().as_str() != theirs.hash {
             // The peer's file changed between its manifest and our fetch;
             // the next round will see the new hash.
@@ -210,6 +213,16 @@ pub fn sync_peer(
                 continue;
             }
         }
+        // A log that merged into something other than the peer's copy has
+        // diverged from it (two branches of a session). Keep the peer's copy,
+        // so its next growth can still come as a tail from there.
+        if rel.ends_with(".jsonl") {
+            if result == remote_bytes {
+                forget_peer_copy(peer_copies, rel);
+            } else {
+                keep_peer_copy(peer_copies, rel, &remote_bytes);
+            }
+        }
         let seen = state.seen.entry(peer.to_string()).or_default();
         seen.insert(rel.clone(), theirs.hash.clone());
         // Remember our copy's hash as the scanner will see it: rewriting paths
@@ -225,31 +238,58 @@ pub fn sync_peer(
     Ok(report)
 }
 
-/// A log that only grew on the peer: fetch just the new bytes. Returns the
-/// peer's whole file (ours + the tail) and the tail's length, or `None` when
-/// that doesn't give the peer's hash (it diverged or shrank, or the peer is
-/// too old for `tail`), so the caller fetches it whole.
+/// A log that only grew on the peer: fetch just the new bytes. The base is
+/// the peer's copy we kept when we diverged from it, else our own copy.
+/// Returns the peer's whole file (base + tail) and the tail's length, or
+/// `None` when no base plus its tail gives the peer's hash (it diverged or
+/// shrank, or the peer is too old for `tail`), so the caller fetches it whole.
 fn fetch_tail(
     conn: &mut Peer,
     rel: &str,
     have_ours: bool,
     scanner: &Scanner,
     theirs: &crate::scan::Entry,
+    peer_copies: &Path,
 ) -> std::io::Result<Option<(Vec<u8>, usize)>> {
     if !have_ours || !rel.ends_with(".jsonl") {
         return Ok(None);
     }
-    let Some(mut mine) = scanner.read_canonical(rel) else {
-        return Ok(None);
-    };
-    let Ok(tail) = conn.tail(rel, mine.len()) else {
-        // `err`: an old peer, or the file shrank there. The stream is still
-        // in step (a whole response was read), so carry on with `file`.
-        return Ok(None);
-    };
-    let tail_len = tail.len();
-    mine.extend_from_slice(&tail);
-    Ok((blake3::hash(&mine).to_hex().as_str() == theirs.hash).then_some((mine, tail_len)))
+    let bases = [
+        std::fs::read(peer_copy_path(peer_copies, rel)).ok(),
+        scanner.read_canonical(rel),
+    ];
+    for mut base in bases.into_iter().flatten() {
+        let Ok(tail) = conn.tail(rel, base.len()) else {
+            // `err`: an old peer, or the file shrank there. The stream is
+            // still in step (a whole response was read), so carry on.
+            continue;
+        };
+        let tail_len = tail.len();
+        base.extend_from_slice(&tail);
+        if blake3::hash(&base).to_hex().as_str() == theirs.hash {
+            return Ok(Some((base, tail_len)));
+        }
+    }
+    Ok(None)
+}
+
+fn peer_copy_path(dir: &Path, rel: &str) -> PathBuf {
+    dir.join(format!(
+        "{}.jsonl",
+        &blake3::hash(rel.as_bytes()).to_hex()[..32]
+    ))
+}
+
+fn keep_peer_copy(dir: &Path, rel: &str, bytes: &[u8]) {
+    if let Err(e) =
+        std::fs::create_dir_all(dir).and_then(|()| write_atomic(&peer_copy_path(dir, rel), bytes))
+    {
+        log!("can't keep the peer's copy of {rel}: {e}");
+    }
+}
+
+fn forget_peer_copy(dir: &Path, rel: &str) {
+    let _ = std::fs::remove_file(peer_copy_path(dir, rel));
 }
 
 /// Merge our canonical bytes with the peer's. Returns the result and whether

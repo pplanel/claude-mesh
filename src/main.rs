@@ -139,6 +139,9 @@ fn round(node: &Node) {
             &mut conn,
             &node.scanner,
             &mut state,
+            // Next to the state file (state.peers/<peer>), never inside the
+            // synced folder.
+            &node.state_path.with_extension("peers").join(&peer.name),
         ) {
             Ok(r) if r.pulled + r.merged + r.conflicts + r.failed > 0 => log!(
                 "{}: pulled {}, merged {}, conflicts {}, busy {}, failed {}, fetched {} KiB ({} as tails)",
