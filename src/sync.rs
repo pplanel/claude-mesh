@@ -116,6 +116,23 @@ pub fn sync_peer(
             // the next round will see the new hash.
             continue;
         }
+        // The same bytes on disk once written in our layout: the same file,
+        // whatever the canonical forms say (rewriting paths isn't always
+        // reversible). Record it; nothing to merge, nothing in conflict.
+        if ours.is_some()
+            && std::fs::read(&path).ok()
+                == Some(canon.content_from_canonical(&local_rel, &remote_bytes))
+        {
+            state
+                .seen
+                .entry(peer.to_string())
+                .or_default()
+                .insert(rel.clone(), theirs.hash.clone());
+            if let Some(o) = ours {
+                state.local.insert(rel.clone(), o.hash.clone());
+            }
+            continue;
+        }
         let local_bytes = ours.and_then(|_| scanner.read_canonical(rel));
 
         let (result, conflict) = match &local_bytes {
@@ -137,7 +154,12 @@ pub fn sync_peer(
         // layout, a permission) is logged and skipped, not the whole round.
         // It counts as seen, so it's retried when the peer's copy changes.
         let written = (|| -> std::io::Result<Option<bool>> {
-            if conflict && let Some(mine) = &local_bytes {
+            // A conflict copy that itself conflicts isn't copied again: that
+            // would nest (`x.conflict-a.conflict-a…`) a little more each round.
+            if conflict
+                && !rel.contains(".conflict-")
+                && let Some(mine) = &local_bytes
+            {
                 let conflict_rel = conflict_name(&local_rel, this_host);
                 if let Some(cpath) = scanner.local_path(&conflict_rel) {
                     write_atomic(&cpath, &canon.content_from_canonical(&local_rel, mine))?;
@@ -175,9 +197,15 @@ pub fn sync_peer(
         }
         let seen = state.seen.entry(peer.to_string()).or_default();
         seen.insert(rel.clone(), theirs.hash.clone());
+        // Remember our copy's hash as the scanner will see it: rewriting paths
+        // isn't always reversible (text that names another Mac's config dir
+        // becomes a token there), so re-reading what we wrote can give other
+        // canonical bytes than `result`. Recording `result`'s hash would make
+        // the next round think we changed the file, and conflict forever.
+        let ours_now = scanner.read_canonical(rel).unwrap_or(result);
         state
             .local
-            .insert(rel.clone(), blake3::hash(&result).to_hex().to_string());
+            .insert(rel.clone(), blake3::hash(&ours_now).to_hex().to_string());
     }
     Ok(report)
 }

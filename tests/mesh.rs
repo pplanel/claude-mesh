@@ -213,3 +213,60 @@ fn a_file_that_cant_be_written_doesnt_stop_the_round() {
     assert!(st.success());
     assert_eq!(read(&mesh.dirs[0], "plans/ok.md"), "still arrives");
 }
+
+#[test]
+fn two_canonical_forms_of_one_file_dont_conflict_forever() {
+    // Text naming a path only one layout rewrites ("/Users/pplanel/src/.claude"
+    // is plain text on arrakis, `@SRC@/.claude` on caladan) gets different
+    // canonical bytes on each side, and arrakis can't write the peers' form
+    // back without it reading as something else. With arrakis's copy the
+    // oldest, as when a file is born there, that must not conflict (and copy
+    // the copies) every round.
+    let mesh = start();
+    let rel = "projects/-Users-pplanel/tool-results/t1.txt";
+    write(&mesh.dirs[0], rel, "see /Users/pplanel/src/.claude/x\n");
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(mesh.dirs[0].join(rel))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let conflicts = |mesh: &Mesh| -> Vec<String> {
+        mesh.dirs
+            .iter()
+            .flat_map(|d| walk(d))
+            .filter(|p| p.contains(".conflict-"))
+            .collect()
+    };
+    converge(&mesh);
+    let first = conflicts(&mesh);
+    // At most the one honest conflict of first contact (the rewritten path
+    // really reads differently on arrakis), and never a copy of a copy.
+    assert!(
+        first.iter().all(|p| p.matches(".conflict-").count() == 1),
+        "{first:?}"
+    );
+    // And nothing new afterwards: the Macs agree and stay put.
+    for _ in 0..3 {
+        converge(&mesh);
+    }
+    let mut later = conflicts(&mesh);
+    let mut first = first;
+    later.sort();
+    first.sort();
+    assert_eq!(later, first);
+}
+
+fn walk(dir: &Path) -> Vec<String> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p.display().to_string());
+        }
+    }
+    out
+}
