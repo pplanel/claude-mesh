@@ -386,3 +386,30 @@ fn a_log_that_reads_back_differently_still_grows_by_tails() {
         "{log}"
     );
 }
+
+#[test]
+fn an_open_sessions_transcript_is_left_alone_however_quiet() {
+    // arrakis has the session open (sessions/<pid>.json with a live pid);
+    // caladan holds another branch of it. However long arrakis's file has
+    // been quiet, it isn't rewritten until the session ends.
+    let mesh = start();
+    let key = "projects/-Users-pplanel/live-s.jsonl";
+    let a = r#"{"uuid":"a","timestamp":"2026-10-11T10:00:00Z"}"#;
+    let b = r#"{"uuid":"b","timestamp":"2026-10-11T10:01:00Z"}"#;
+    let c = r#"{"uuid":"c","timestamp":"2026-10-08T10:02:00Z"}"#;
+    write(&mesh.dirs[0], key, &format!("{a}\n{b}\n"));
+    write(&mesh.dirs[1], key, &format!("{a}\n{c}\n"));
+    let mut open = Command::new("sleep").arg("30").spawn().unwrap();
+    write(
+        &mesh.dirs[0],
+        "sessions/1.json",
+        &format!(r#"{{"pid":{},"sessionId":"live-s"}}"#, open.id()),
+    );
+    command(&mesh, 0, &["once"]).status().unwrap();
+    assert_eq!(read(&mesh.dirs[0], key), format!("{a}\n{b}\n"));
+    // The session ends: now it merges.
+    open.kill().unwrap();
+    open.wait().unwrap();
+    command(&mesh, 0, &["once"]).status().unwrap();
+    assert!(read(&mesh.dirs[0], key).contains(r#""uuid":"c""#));
+}

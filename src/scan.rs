@@ -54,6 +54,11 @@ impl Scanner {
         }
     }
 
+    /// The Claude config folder this scanner reads.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn canon(&self) -> &Canon {
         &self.canon
     }

@@ -93,6 +93,7 @@ pub fn sync_peer(
     let local = scanner.manifest();
     let canon = scanner.canon();
     let now = now_ms();
+    let live = live_sessions(scanner.root());
     let mut report = Report::default();
 
     for (rel, theirs) in &remote {
@@ -111,7 +112,7 @@ pub fn sync_peer(
         let Some(path) = scanner.local_path(&local_rel) else {
             continue;
         };
-        if is_active(&path, now) {
+        if is_active(&path, now) || belongs_to(&local_rel, &live) {
             report.skipped_active += 1;
             continue;
         }
@@ -363,6 +364,43 @@ fn is_active(path: &Path, now: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Sessions open on this Mac right now: Claude Code keeps
+/// `sessions/<pid>.json` with the `sessionId` of each running process.
+/// Their files are left alone however long they've been quiet (a long tool
+/// call writes nothing for minutes); they merge once the session ends.
+pub fn live_sessions(config: &Path) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(config.join("sessions")) else {
+        return vec![];
+    };
+    dir.flatten()
+        .filter_map(|e| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            let pid = v["pid"].as_u64()?;
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            alive.then(|| v["sessionId"].as_str().map(str::to_string))?
+        })
+        .collect()
+}
+
+/// Whether `rel` (`projects/<key>/<session>.jsonl` or anything under
+/// `projects/<key>/<session>/`) is one of `sessions`' files.
+fn belongs_to(rel: &str, sessions: &[String]) -> bool {
+    let mut parts = rel.split('/');
+    if parts.next() != Some("projects") || parts.next().is_none() {
+        return false;
+    }
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    let id = name.strip_suffix(".jsonl").unwrap_or(name);
+    sessions.iter().any(|s| s == id)
+}
+
 /// `memory/note.md` → `memory/note.conflict-arrakis.md`.
 pub fn conflict_name(rel: &str, host: &str) -> String {
     let (dir, file) = rel.rsplit_once('/').map_or(("", rel), |(d, f)| (d, f));
@@ -387,6 +425,16 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_sessions_files_are_its_transcript_and_folder() {
+        let live = vec!["8de4".to_string()];
+        assert!(belongs_to("projects/k/8de4.jsonl", &live));
+        assert!(belongs_to("projects/k/8de4/subagents/a.jsonl", &live));
+        assert!(!belongs_to("projects/k/other.jsonl", &live));
+        assert!(!belongs_to("projects/k/memory/MEMORY.md", &live));
+        assert!(!belongs_to("plans/8de4.jsonl", &live));
+    }
 
     #[test]
     fn conflict_names_keep_the_extension() {
