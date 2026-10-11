@@ -42,7 +42,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Serve the protocol on `addr`, one thread per connection.
 pub fn serve_tcp(addr: &str, host: String, scanner: Arc<Scanner>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    log!("serving on {addr}");
+    // The bound address, not the requested one: with port 0 the system picks
+    // a free port, and this line is how the tests learn it.
+    log!("serving on {}", listener.local_addr()?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let (host, scanner) = (host.clone(), Arc::clone(&scanner));

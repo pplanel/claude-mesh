@@ -2,10 +2,11 @@
 //! its own Claude config folder, talking over localhost (`tcp:` routes)
 //! instead of airshell.
 
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const HOSTS: [&str; 3] = ["arrakis", "caladan", "imperium"];
 
@@ -25,14 +26,6 @@ impl Drop for Mesh {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn command(mesh: &Mesh, i: usize, args: &[&str]) -> Command {
     let peers: Vec<String> = (0..3)
         .filter(|&j| j != i)
@@ -46,7 +39,6 @@ fn command(mesh: &Mesh, i: usize, args: &[&str]) -> Command {
             "CLAUDE_MESH_STATE",
             mesh.dirs[i].with_extension("state.json"),
         )
-        .env("CLAUDE_MESH_LISTEN", format!("127.0.0.1:{}", mesh.ports[i]))
         .env("CLAUDE_MESH_PEERS", peers.join(";"))
         .env("CLAUDE_MESH_ACTIVE_MS", "0");
     c
@@ -58,25 +50,63 @@ fn start() -> Mesh {
     for d in &dirs {
         std::fs::create_dir_all(d).unwrap();
     }
-    let ports: Vec<u16> = HOSTS.iter().map(|_| free_port()).collect();
     let mut mesh = Mesh {
         _tmp: tmp,
         dirs,
-        ports,
+        ports: vec![0; HOSTS.len()],
         servers: vec![],
     };
-    for i in 0..3 {
-        let child = command(&mesh, i, &["serve", "--interval", "3600"])
+    for (i, host) in HOSTS.iter().enumerate() {
+        // Each server binds port 0 and says which port it got ("serving on
+        // 127.0.0.1:N"): picking a free port first and handing it over left a
+        // window where a parallel test could take it.
+        //
+        // The servers only answer. A server's own pull round (it runs one at
+        // startup) would race the test's `once` for the same Mac: two
+        // processes writing the same folder and state file. With no peers,
+        // its rounds do nothing.
+        let mut child = command(&mesh, i, &["serve", "--interval", "3600"])
+            .env("CLAUDE_MESH_LISTEN", "127.0.0.1:0")
+            .env("CLAUDE_MESH_PEERS", "")
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let (port, rx) = mpsc::channel();
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr = child.stderr.take().unwrap();
+        let log = std::sync::Arc::clone(&said);
+        std::thread::spawn(move || {
+            // Keep reading after the port, so the server never blocks on a
+            // full pipe.
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut l) = log.lock() {
+                    l.push_str(&line);
+                    l.push('\n');
+                }
+                if let Some(addr) = line.split("serving on ").nth(1)
+                    && let Some(p) = addr
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                {
+                    let _ = port.send(p);
+                }
+            }
+        });
         mesh.servers.push(child);
-    }
-    for &p in &mesh.ports {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", p)).is_err() {
-            assert!(Instant::now() < deadline, "server on {p} didn't start");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let got = rx.recv_timeout(Duration::from_secs(60));
+        mesh.ports[i] = got.unwrap_or_else(|e| {
+            let server = mesh.servers.last_mut().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let status = server.try_wait().ok().flatten().map(|s| {
+                use std::os::unix::process::ExitStatusExt;
+                format!("code {:?} signal {:?}", s.code(), s.signal())
+            });
+            panic!(
+                "{host} didn't start ({e}, {status:?}):\n{}",
+                said.lock().map(|s| s.clone()).unwrap_or_default()
+            )
+        });
     }
     mesh
 }
