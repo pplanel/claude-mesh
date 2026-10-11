@@ -1,8 +1,16 @@
 //! How two versions of a file become one.
 //!
-//! Every function here is **symmetric**: `merge(a, b) == merge(b, a)`. Each
-//! Mac merges what it pulls into its own copy, so symmetry is what makes the
-//! three Macs end up with the same bytes.
+//! Every function here is **symmetric**, `merge(a, b) == merge(b, a)`, and
+//! **idempotent**, merging the result with either input gives the result
+//! back. Each Mac merges what it pulls into its own copy, in whatever order
+//! the rounds happen; symmetry is what makes the three Macs end up with the
+//! same bytes, and idempotence is what makes them stop changing once they do.
+//!
+//! | Files ([`strategy_for`])        | Rule                                 |
+//! |---------------------------------|--------------------------------------|
+//! | `*.jsonl` (transcripts, history)| [`merge_jsonl`]: longer prefix, or both branches |
+//! | `memory/MEMORY.md`              | [`merge_line_union`]: every line once |
+//! | everything else                 | [`last_writer_wins`], loser kept as a conflict copy |
 
 use std::collections::HashSet;
 
@@ -78,11 +86,16 @@ pub fn last_writer_wins(a_mtime: u64, a: &[u8], b_mtime: u64, b: &[u8]) -> bool 
 /// Which merge a canonical path gets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Strategy {
+    /// An append-only log: [`merge_jsonl`].
     Jsonl,
+    /// A set of lines (the memory index): [`merge_line_union`].
     LineUnion,
+    /// Anything else: [`last_writer_wins`], with a conflict copy when both
+    /// sides changed it.
     LastWriterWins,
 }
 
+/// The merge for the canonical path `rel`, by its name alone.
 pub fn strategy_for(rel: &str) -> Strategy {
     if rel.ends_with(".jsonl") {
         Strategy::Jsonl
@@ -93,6 +106,7 @@ pub fn strategy_for(rel: &str) -> Strategy {
     }
 }
 
+/// `s` split into lines, without their newlines.
 fn lines(s: &str) -> Vec<&str> {
     s.lines().collect()
 }

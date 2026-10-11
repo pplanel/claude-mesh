@@ -42,6 +42,7 @@ tail -f ~/Library/Logs/claude-mesh.log
 
 ## Docs
 
+- [docs/codebase.md](docs/codebase.md): a guided tour of the code, module by module, with diagrams. The reference is the rustdoc: `cargo doc --document-private-items --open`.
 - [docs/setup.md](docs/setup.md): installing on the three Macs, airshell entries, authorization, checks.
 - [docs/design.md](docs/design.md): how it works, the canonical form, merge rules, why it converges.
 - [docs/operations.md](docs/operations.md): logs, troubleshooting, known limits, removing it.

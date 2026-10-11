@@ -13,6 +13,21 @@
 //! | `tail <hex> <offset>` | those bytes from `offset` on (a grown log) |
 //!
 //! Every response is a line `ok <len>` or `err <len>`, then `<len>` bytes.
+//! Paths travel hex-encoded ([`hex_encode`]), so a name with spaces or
+//! newlines can't break the line framing.
+//!
+//! A round is one connection: `health` first (it proves the route works,
+//! within [`CONNECT_TIMEOUT`]), then `manifest`, then `file`/`tail` per file
+//! that changed. An `err` response leaves the stream in step, so a client can
+//! fall back (from `tail` to `file`, say) on the same connection; a broken
+//! stream ends the round.
+//!
+//! ```text
+//! → health                     ← ok 39  {"host":"caladan","version":"0.1.0"}
+//! → manifest                   ← ok 81234  {"history.jsonl":{"hash":…,"size":…,"mtime":…},…}
+//! → tail 70726f6a…6c 1048576   ← ok 2210  <the 2210 bytes past offset 1048576>
+//! → file 706c616e…6d64         ← ok 512  <the whole file>
+//! ```
 
 use crate::scan::Scanner;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -59,6 +74,8 @@ pub fn serve_stream(
     Ok(())
 }
 
+/// One request's response: `(ok, body)`. Never fails: a bad request is an
+/// `err` with a message, so the stream stays in step.
 fn answer(request: &str, host: &str, scanner: &Scanner) -> (bool, Vec<u8>) {
     match request.split_once(' ').unwrap_or((request, "")) {
         ("health", _) => {
@@ -92,7 +109,9 @@ fn answer(request: &str, host: &str, scanner: &Scanner) -> (bool, Vec<u8>) {
 pub struct Peer {
     /// The `airshell-connect` process carrying the stream, if any.
     child: Option<Arc<Mutex<Child>>>,
+    /// Where requests go: the child's stdin, or the TCP stream.
     input: Box<dyn Write + Send>,
+    /// Where responses come from: the child's stdout, or the TCP stream.
     output: BufReader<Box<dyn Read + Send>>,
     /// The `health` answer it gave when we connected.
     pub health: String,
@@ -110,6 +129,7 @@ impl Peer {
         }
     }
 
+    /// A `tcp:<addr>` route: a direct connection to a `serve`.
     fn tcp(addr: &str) -> std::io::Result<Peer> {
         let stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
@@ -125,6 +145,10 @@ impl Peer {
         Ok(peer)
     }
 
+    /// A command route: its stdin/stdout is the stream. A watchdog kills it
+    /// if `health` hasn't come back within [`CONNECT_TIMEOUT`], and on failure
+    /// the last line of its stderr becomes the error (airshell-connect says
+    /// why there: not found, certificate refused, not authorized).
     fn command(argv: &[String]) -> std::io::Result<Peer> {
         let (program, args) = argv.split_first().ok_or_else(|| other("empty route"))?;
         let mut child = Command::new(program)
@@ -208,6 +232,7 @@ impl Peer {
         }
     }
 
+    /// The canonical bytes of the canonical path `rel`.
     pub fn file(&mut self, rel: &str) -> std::io::Result<Vec<u8>> {
         self.request(&format!("file {}", hex_encode(rel)))
     }
@@ -229,14 +254,18 @@ impl Drop for Peer {
     }
 }
 
+/// An I/O error carrying `msg`.
 fn other(msg: &str) -> std::io::Error {
     std::io::Error::other(msg.to_string())
 }
 
+/// `s`'s UTF-8 bytes as lowercase hex: `"ab"` → `"6162"`.
 pub fn hex_encode(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The inverse of [`hex_encode`]; `None` for odd lengths, non-hex digits or
+/// bytes that aren't UTF-8.
 pub fn hex_decode(s: &str) -> Option<String> {
     if !s.len().is_multiple_of(2) {
         return None;

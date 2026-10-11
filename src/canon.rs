@@ -6,34 +6,81 @@
 //! rewritten into canonical form, with the local paths replaced by tokens;
 //! the receiving Mac turns the tokens back into its own paths.
 //!
-//! | Local (arrakis)                             | Canonical            |
-//! |---------------------------------------------|----------------------|
-//! | `/Users/pplanel/src/pplanel/.claude`        | `@CFG@`              |
-//! | `/Users/pplanel/src/pplanel`                | `@SRC@`              |
-//! | `projects/-Users-pplanel-src-pplanel-x`     | `projects/@SRCKEY@-x`|
+//! | Local (arrakis)                                   | Canonical                |
+//! |---------------------------------------------------|--------------------------|
+//! | `/Users/pplanel/src/pplanel/.claude` (in text)    | [`CFG`] `@CFG@`          |
+//! | `/Users/pplanel/src/pplanel` (in text)            | [`SRC`] `@SRC@`          |
+//! | `projects/-Users-pplanel-src-pplanel-x` (folder)  | `projects/@SRCKEY@-x`    |
+//! | `projects/-Users-pplanel-src-pplanel--claude-x`   | `projects/@CFGKEY@-x`    |
 //!
-//! Comparing canonical hashes is what lets the same conversation on two Macs
-//! count as "the same file".
+//! On caladan the same session lives in `projects/-Users-pplanel-src-x` and
+//! mentions `/Users/pplanel/src/x`; both sides produce the same canonical
+//! bytes, so the same conversation on two Macs has the same hash and counts
+//! as "the same file".
+//!
+//! Two parts, two rules:
+//!
+//! * **Names** ([`Canon::rel_to_canonical`]): only the project folder under
+//!   `projects/` depends on the Mac, and only at a `-` boundary, so
+//!   `-Users-pplanel-srcfoo` is never mistaken for the source folder.
+//! * **Contents** ([`Canon::content_to_canonical`]): text files only
+//!   (`.jsonl`, `.json`, `.md`, `.txt`), as plain string replacement, longest
+//!   path first, because on arrakis the config folder is inside the source
+//!   folder. Anything else is copied byte for byte.
+//!
+//! # When it isn't reversible
+//!
+//! Replacing text is not a bijection. On arrakis, `@SRC@/.claude` and
+//! `@CFG@` both turn into `/Users/pplanel/src/pplanel/.claude`, and text that
+//! *quotes* another Mac's path (`/Users/pplanel/src/.claude` is plain text
+//! on arrakis, `@SRC@/.claude` on caladan) reads back differently than it was
+//! written. So a file written from canonical bytes `c` can read back as
+//! canonical bytes `c' != c`. [`crate::sync`] never assumes the round trip:
+//! it hashes what it reads back, compares files on disk, and keeps the peer's
+//! copy as the base for tails. The quoted path itself may end up rewritten;
+//! that's the documented limit of textual rewriting.
 
 use crate::layout::{Host, project_key};
 
+/// Stands for this Mac's Claude config folder in canonical contents.
 pub const CFG: &str = "@CFG@";
+/// Stands for this Mac's source folder in canonical contents.
 pub const SRC: &str = "@SRC@";
+/// Stands for the source folder's project key (`-Users-pplanel-src…`), in
+/// canonical project folder names and in `projects/…` paths inside contents.
 pub const SRCKEY: &str = "@SRCKEY@";
+/// Stands for the config folder's project key, in canonical project folder
+/// names (sessions started inside the config folder itself).
+pub const CFGKEY: &str = "@CFGKEY@";
 
 /// File extensions whose contents get path rewriting. Everything else is
 /// copied byte for byte.
 const TEXT_EXTENSIONS: &[&str] = &["jsonl", "json", "md", "txt"];
 
+/// One Mac's translation to and from canonical form, built from its
+/// [`Host`] entry.
+///
+/// ```ignore
+/// let arrakis = Canon::new(&layout::find("arrakis").unwrap());
+/// assert_eq!(
+///     arrakis.rel_to_canonical("projects/-Users-pplanel-src-pplanel-x/s.jsonl"),
+///     "projects/@SRCKEY@-x/s.jsonl"
+/// );
+/// ```
 #[derive(Clone, Debug)]
 pub struct Canon {
+    /// The source folder, without a trailing `/`.
     src: String,
+    /// The Claude config folder, without a trailing `/`.
     config: String,
+    /// [`project_key`] of `src`, e.g. `-Users-pplanel-src-pplanel`.
     src_key: String,
+    /// [`project_key`] of `config`, e.g. `-Users-pplanel-src-pplanel--claude`.
     config_key: String,
 }
 
 impl Canon {
+    /// The translation for `host`'s source and config folders.
     pub fn new(host: &Host) -> Self {
         let src = host.src.to_string_lossy().trim_end_matches('/').to_string();
         let config = host
@@ -58,6 +105,8 @@ impl Canon {
         }
     }
 
+    /// The inverse of [`Canon::rel_to_canonical`]: a canonical path relative
+    /// to the config folder, as it is named on this Mac.
     pub fn rel_from_canonical(&self, rel: &str) -> String {
         match split_project(rel) {
             Some((key, rest)) => format!("projects/{}{}", self.key_from_canonical(key), rest),
@@ -65,11 +114,14 @@ impl Canon {
         }
     }
 
+    /// A project folder name in canonical form: the config key or the source
+    /// key, at a `-` boundary, replaced by its token; anything else as is
+    /// (e.g. `-Users-pplanel`, the home folder, is the same everywhere).
     fn key_to_canonical(&self, key: &str) -> String {
         // The config folder can live under the source folder (arrakis), so its
         // key is the longer match and goes first.
         if let Some(rest) = strip_key_prefix(key, &self.config_key) {
-            return format!("@CFGKEY@{rest}");
+            return format!("{CFGKEY}{rest}");
         }
         if let Some(rest) = strip_key_prefix(key, &self.src_key) {
             return format!("{SRCKEY}{rest}");
@@ -77,8 +129,9 @@ impl Canon {
         key.to_string()
     }
 
+    /// The inverse of [`Canon::key_to_canonical`].
     fn key_from_canonical(&self, key: &str) -> String {
-        if let Some(rest) = key.strip_prefix("@CFGKEY@") {
+        if let Some(rest) = key.strip_prefix(CFGKEY) {
             return format!("{}{rest}", self.config_key);
         }
         if let Some(rest) = key.strip_prefix(SRCKEY) {
@@ -87,12 +140,16 @@ impl Canon {
         key.to_string()
     }
 
+    /// Whether `rel`'s contents get path rewriting (its extension is one of
+    /// `TEXT_EXTENSIONS`).
     pub fn is_text(rel: &str) -> bool {
         rel.rsplit_once('.')
             .is_some_and(|(_, ext)| TEXT_EXTENSIONS.contains(&ext))
     }
 
-    /// File contents in canonical form. Binary files pass through unchanged.
+    /// File contents in canonical form: this Mac's `projects/<src key>`,
+    /// config folder and source folder replaced by their tokens, longest
+    /// first. Binary files, and text that isn't UTF-8, pass through unchanged.
     pub fn content_to_canonical(&self, rel: &str, bytes: &[u8]) -> Vec<u8> {
         if !Self::is_text(rel) {
             return bytes.to_vec();
@@ -111,6 +168,9 @@ impl Canon {
         text.into_bytes()
     }
 
+    /// Canonical contents in this Mac's form: the tokens replaced by its own
+    /// paths. Not always the exact inverse of [`Canon::content_to_canonical`];
+    /// see the module docs.
     pub fn content_from_canonical(&self, rel: &str, bytes: &[u8]) -> Vec<u8> {
         if !Self::is_text(rel) {
             return bytes.to_vec();

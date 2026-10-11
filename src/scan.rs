@@ -1,4 +1,12 @@
 //! What gets synced, and the manifest that describes it.
+//!
+//! A [`Manifest`] maps every synced file's **canonical** path to an [`Entry`]
+//! (hash of its canonical contents, size, mtime). It is what a Mac sends a
+//! peer first each round; the peer compares it with its own and fetches
+//! only what differs. Only the top-level entries in [`INCLUDE`] are walked,
+//! symlinks are never followed, and files over [`MAX_FILE_BYTES`] are left
+//! out. Hashing is the expensive part, so [`Scanner`] remembers each file's
+//! entry and re-reads a file only when its size or mtime changed.
 
 use crate::canon::Canon;
 use serde::{Deserialize, Serialize};
@@ -30,6 +38,7 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub struct Entry {
     /// BLAKE3 of the canonical content, hex.
     pub hash: String,
+    /// Size of the file on disk (this Mac's form, not the canonical one).
     pub size: u64,
     /// Modification time, milliseconds since the Unix epoch.
     pub mtime: u64,
@@ -40,12 +49,17 @@ pub type Manifest = BTreeMap<String, Entry>;
 
 /// Builds manifests, re-reading only files whose size or mtime changed.
 pub struct Scanner {
+    /// The Claude config folder.
     root: PathBuf,
+    /// This Mac's translation to canonical form.
     canon: Canon,
+    /// Absolute path → (size, mtime, entry) when it was last hashed. Shared
+    /// by the server threads and the pull loop, hence the mutex.
     cache: Mutex<BTreeMap<PathBuf, (u64, u64, Entry)>>,
 }
 
 impl Scanner {
+    /// A scanner of the config folder `root`, translating with `canon`.
     pub fn new(root: PathBuf, canon: Canon) -> Self {
         Scanner {
             root,
@@ -59,10 +73,13 @@ impl Scanner {
         &self.root
     }
 
+    /// This Mac's translation to and from canonical form.
     pub fn canon(&self) -> &Canon {
         &self.canon
     }
 
+    /// Walk the synced entries and describe every file in canonical form.
+    /// Files unchanged since the last call (same size and mtime) aren't read.
     pub fn manifest(&self) -> Manifest {
         let mut files = Vec::new();
         for top in INCLUDE {
@@ -133,6 +150,8 @@ pub fn is_safe_rel(rel: &str) -> bool {
             .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
+/// A file's modification time in milliseconds since the Unix epoch (0 when
+/// the system won't say).
 pub fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
@@ -167,6 +186,7 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `path` relative to `root`, as UTF-8 (`None` for anything else).
 fn rel_str(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let s = rel.to_str()?;

@@ -1,6 +1,49 @@
 //! `claude-mesh`: keep Claude Code's state in sync across the Macs, over
-//! airshell. See README.md and docs/.
+//! airshell, so every Mac sees every session, memory, plan and prompt.
+//!
+//! ```text
+//!   arrakis                         caladan                         imperium
+//!   ~/src/pplanel/.claude           ~/.claude                       ~/.claude
+//!        │ scan                          │ scan                          │ scan
+//!   claude-mesh serve ◀── pull ─── claude-mesh serve ◀── pull ─── claude-mesh serve
+//!        │          ─── pull ──▶         │          ─── pull ──▶         │
+//!   airshell-proxy  ═════ QUIC (LAN or AWDL), paired Macs only ═════ airshell-proxy
+//! ```
+//!
+//! Every Mac runs `serve`: it answers its peers' requests on
+//! `127.0.0.1:7480` (airshell-proxy relays them there), and every 30 s it
+//! pulls from each peer and merges into its own config folder. No Mac ever
+//! writes to another.
+//!
+//! # Reading order
+//!
+//! Follow a file from one Mac's disk to another's:
+//!
+//! 1. [`layout`]: where each Mac keeps its sources and its Claude config.
+//! 2. [`canon`]: the machine-independent form names and contents travel in.
+//! 3. [`scan`]: what is synced, and the [`scan::Manifest`] that describes it.
+//! 4. [`airshell`] and [`wire`]: how a Mac reaches a peer, and what they say.
+//! 5. [`sync`]: what a Mac does with each file a peer has.
+//! 6. [`merge`]: how two versions become one, the same way on every Mac.
+//! 7. This file: the commands, the round loop, the environment.
+//!
+//! `docs/codebase.md` walks the same path with diagrams; `docs/design.md`
+//! has the decisions, `docs/operations.md` the failure modes.
+//!
+//! # Commands
+//!
+//! | Command    | What it does                                                   |
+//! |------------|----------------------------------------------------------------|
+//! | `serve`    | [`serve`]: listen, register with airshell-proxy, pull forever  |
+//! | `once`     | [`once`]: one pull round against every peer                    |
+//! | `status`   | [`status`]: this Mac, and whether each peer answers            |
+//! | `register` | [`register`]: add this Mac's service to airshell-proxy         |
 
+// Every item documented, private ones included: `cargo doc
+// --document-private-items` is the code's reference.
+#![warn(clippy::missing_docs_in_private_items)]
+
+/// `eprintln!` with a `[unix seconds]` prefix: the daemon's log line.
 macro_rules! log {
     ($($arg:tt)*) => {
         eprintln!("{} {}", $crate::timestamp(), format!($($arg)*))
@@ -24,6 +67,7 @@ use std::time::Duration;
 use sync::State;
 use wire::Peer;
 
+/// `claude-mesh` with no or unknown arguments prints this.
 const USAGE: &str = "\
 claude-mesh — keep Claude Code's state in sync across Macs, over airshell
 
@@ -65,19 +109,29 @@ const SERVE_PORT: u16 = 7480;
 
 /// A peer and the route that reaches it.
 struct PeerSpec {
+    /// Its name in the layout table.
     name: String,
+    /// The command (or `tcp:<addr>`) that opens a stream to it; see
+    /// [`wire::Peer::connect`].
     route: Vec<String>,
 }
 
 /// Everything a command needs to know about this Mac.
 struct Node {
+    /// This Mac's layout entry (its config folder possibly overridden).
     host: Host,
+    /// Scans this Mac's config folder; shared with the server threads.
     scanner: Arc<Scanner>,
+    /// Where [`State`] is kept between rounds.
     state_path: PathBuf,
+    /// Where `serve` listens, `127.0.0.1:7480` unless overridden.
     listen: String,
+    /// Every other Mac, and how to reach it.
     peers: Vec<PeerSpec>,
 }
 
+/// This Mac, from the layout table and the `CLAUDE_MESH_*` overrides. Fails
+/// when this Mac isn't in the table.
 fn node() -> Result<Node, String> {
     let name = layout::this_host_name();
     let hosts = layout::hosts()?;
@@ -123,6 +177,8 @@ fn node() -> Result<Node, String> {
     })
 }
 
+/// One pull round: for each peer, connect, [`sync::sync_peer`], log what
+/// changed, save the state. An unreachable peer is logged and skipped.
 fn round(node: &Node) {
     let mut state = State::load(&node.state_path);
     for peer in &node.peers {
@@ -163,6 +219,9 @@ fn round(node: &Node) {
     }
 }
 
+/// `serve [--interval SECS]`: start the server thread, register with
+/// airshell-proxy (unless peers come from `CLAUDE_MESH_PEERS`), then run a
+/// [`round`] every interval, forever. Exits only if the server stops.
 fn serve(args: &[String]) -> i32 {
     let node = match node() {
         Ok(n) => n,
@@ -205,6 +264,7 @@ fn serve(args: &[String]) -> i32 {
     }
 }
 
+/// `once`: one [`round`], then exit.
 fn once() -> i32 {
     match node() {
         Ok(n) => {
@@ -215,6 +275,8 @@ fn once() -> i32 {
     }
 }
 
+/// `status`: this Mac's name, config folder, state file and file count, and
+/// each peer's `health` answer (or why it can't be reached).
 fn status() -> i32 {
     let node = match node() {
         Ok(n) => n,
@@ -234,6 +296,7 @@ fn status() -> i32 {
     0
 }
 
+/// `register`: [`airshell::register`] this Mac's service, then exit.
 fn register() -> i32 {
     let node = match node() {
         Ok(n) => n,
@@ -248,6 +311,7 @@ fn register() -> i32 {
     }
 }
 
+/// The port of a `host:port` listen address ([`SERVE_PORT`] if unparsable).
 fn listen_port(listen: &str) -> u16 {
     listen
         .rsplit_once(':')
@@ -255,11 +319,13 @@ fn listen_port(listen: &str) -> u16 {
         .unwrap_or(SERVE_PORT)
 }
 
+/// Print `msg` as an error and return the exit code 1.
 fn fail(msg: &str) -> i32 {
     eprintln!("claude-mesh: {msg}");
     1
 }
 
+/// `[<unix seconds>]`, the prefix of every log line.
 pub fn timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

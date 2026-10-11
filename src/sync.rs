@@ -5,15 +5,27 @@
 //! another, so a bug or a bad peer can only make this Mac fetch too much,
 //! never corrupt someone else's files.
 //!
-//! For each file the peer has, the decision is:
+//! For each file in the peer's manifest, [`sync_peer`] decides:
 //!
-//! 1. Peer's hash unchanged since our last pull → nothing to do.
-//! 2. Same hash as ours → just remember it.
-//! 3. Our copy was written in the last [`ACTIVE_WINDOW_MS`] → skip this round:
-//!    a live Claude session may be appending to it.
-//! 4. Otherwise merge (see [`crate::merge`]) and write the result if it
-//!    differs from ours. Appends are written as appends, so a session that
-//!    starts writing again mid-sync never sees its file replaced.
+//! 1. **Seen**: the peer's hash is the one we pulled last time → nothing.
+//! 2. **Same**: the peer's hash is our copy's → remember it, nothing to write.
+//! 3. **Busy**: our copy was written in the last [`ACTIVE_WINDOW_MS`], or it
+//!    belongs to a session open on this Mac ([`live_sessions`]) → leave it
+//!    for a later round.
+//! 4. **Fetch**: a log just its new bytes when possible ([`fetch_tail`]),
+//!    else the whole file; checked against the peer's hash.
+//! 5. **Same on disk**: the peer's version, written in our layout, is byte
+//!    for byte our file → the same file, whatever the canonical forms say
+//!    (see "When it isn't reversible" in [`crate::canon`]); remember it.
+//! 6. **Merge** ([`resolve`], with [`crate::merge`]) and write the result if
+//!    it differs ([`write_local`]): appends as appends, anything else
+//!    atomically; a lost conflict also writes our version as a copy.
+//! 7. **Remember** the peer's hash, and our copy's hash *as read back*; keep
+//!    the peer's copy when ours reads back differently, as the base for its
+//!    next tail.
+//!
+//! [`State`] is what carries over between rounds; a file that can't be
+//! written here (`failed`) is logged and skipped, never the whole round.
 
 use crate::canon::Canon;
 use crate::merge::{Strategy, last_writer_wins, merge_jsonl, merge_line_union, strategy_for};
@@ -29,6 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `CLAUDE_MESH_ACTIVE_MS` overrides it (tests set it to 0).
 pub const ACTIVE_WINDOW_MS: u64 = 60_000;
 
+/// [`ACTIVE_WINDOW_MS`], or `CLAUDE_MESH_ACTIVE_MS` when set.
 fn active_window_ms() -> u64 {
     std::env::var("CLAUDE_MESH_ACTIVE_MS")
         .ok()
@@ -48,6 +61,8 @@ pub struct State {
 }
 
 impl State {
+    /// The state saved at `path`, or an empty one (first run, or unreadable:
+    /// the worst case is a round that re-checks everything).
     pub fn load(path: &Path) -> State {
         std::fs::read(path)
             .ok()
@@ -55,6 +70,7 @@ impl State {
             .unwrap_or_default()
     }
 
+    /// Write the state to `path` atomically (a temp file, then a rename).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -65,11 +81,16 @@ impl State {
     }
 }
 
+/// What one round against one peer did; logged when anything was written.
 #[derive(Default, Debug)]
 pub struct Report {
+    /// Files we didn't have, or took as the peer's version.
     pub pulled: usize,
+    /// Files whose result combines both sides.
     pub merged: usize,
+    /// Files where our version lost and was saved as a conflict copy.
     pub conflicts: usize,
+    /// Files left alone this round (recently written, or an open session's).
     pub skipped_active: usize,
     /// Files we couldn't write here (logged); retried when the peer's copy changes.
     pub failed: usize,
@@ -275,6 +296,7 @@ fn fetch_tail(
     Ok(None)
 }
 
+/// Where the peer's copy of `rel` is kept: `dir/<blake3(rel), 32 hex>.jsonl`.
 fn peer_copy_path(dir: &Path, rel: &str) -> PathBuf {
     dir.join(format!(
         "{}.jsonl",
@@ -282,6 +304,8 @@ fn peer_copy_path(dir: &Path, rel: &str) -> PathBuf {
     ))
 }
 
+/// Keep `bytes` as the peer's copy of `rel`; a failure only costs a whole
+/// fetch next time, so it's logged, not returned.
 fn keep_peer_copy(dir: &Path, rel: &str, bytes: &[u8]) {
     if let Err(e) =
         std::fs::create_dir_all(dir).and_then(|()| write_atomic(&peer_copy_path(dir, rel), bytes))
@@ -290,6 +314,7 @@ fn keep_peer_copy(dir: &Path, rel: &str, bytes: &[u8]) {
     }
 }
 
+/// Drop the peer's copy of `rel`, if any (ours is the same now).
 fn forget_peer_copy(dir: &Path, rel: &str) {
     let _ = std::fs::remove_file(peer_copy_path(dir, rel));
 }
@@ -343,6 +368,8 @@ fn write_local(
     write_atomic(path, &new_local)
 }
 
+/// Replace `path` with `bytes` in one step: write a temp file next to it,
+/// then rename it over. Readers see the old file or the new one, never half.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
@@ -358,6 +385,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Whether `path` was modified less than the active window before `now`.
 fn is_active(path: &Path, now: u64) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| now.saturating_sub(mtime_ms(&m)) < active_window_ms())
@@ -415,6 +443,7 @@ pub fn conflict_name(rel: &str, host: &str) -> String {
     }
 }
 
+/// Milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

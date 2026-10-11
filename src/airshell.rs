@@ -10,6 +10,19 @@
 //! The service is added through the proxy's control socket (`config.get`,
 //! then `config.apply` with the file's hash), so nobody edits
 //! `~/.config/airshell/config.toml` by hand and the proxy applies it at once.
+//!
+//! ```text
+//!  arrakis                                             caladan
+//!  claude-mesh ─ airshell-connect ═══ QUIC ═══▶ airshell-proxy ─ TCP ─▶ claude-mesh serve
+//!   (pull loop)   caladan-claudesync           (admits paired      127.0.0.1:7480
+//!                 stdin/stdout = the stream     Macs only)
+//! ```
+//!
+//! The control socket speaks newline-delimited JSON (airshell-proto v1):
+//! `{"v":1,"id":N,"method":…,"params":…}` answered by
+//! `{"v":1,"id":N,"ok":…}` or `{…,"err":{"code","message"}}`. Only
+//! `config.get` and `config.apply` are used here, with plain `serde_json`, so
+//! claude-mesh doesn't depend on airshell's (private) crates.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +33,7 @@ use std::time::Duration;
 /// The Bonjour service type of every claude-mesh service.
 pub const SERVICE_TYPE: &str = "_claudesync._udp";
 
+/// The Bonjour name `host`'s service is advertised under: `<host>-claudesync`.
 pub fn service_name(host: &str) -> String {
     format!("{host}-claudesync")
 }
@@ -90,12 +104,16 @@ pub fn register(host: &str, port: u16) -> Result<String, String> {
 
 /// A connection to airshell-proxy's control socket.
 struct Control {
+    /// The socket, for writing requests.
     stream: UnixStream,
+    /// The same socket, for reading responses line by line.
     reader: BufReader<UnixStream>,
+    /// The `id` of the next request; responses are matched to requests by it.
     next_id: u64,
 }
 
 impl Control {
+    /// Connect to this user's airshell-proxy (see [`socket_path`]).
     fn open() -> Result<Control, String> {
         let path = socket_path().ok_or("can't find the per-user temp dir")?;
         let stream = UnixStream::connect(&path)

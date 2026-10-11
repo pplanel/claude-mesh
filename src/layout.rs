@@ -13,11 +13,13 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Where the layout table is read from when `CLAUDE_MESH_LAYOUT` isn't set.
 pub const LAYOUT_FILE: &str = "/etc/claude-mesh/hosts.json";
 
 /// One Mac in the mesh.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Host {
+    /// Its short hostname (`hostname -s`); the table's key in the JSON.
     #[serde(skip)]
     pub name: String,
     /// The user's source folder on this Mac.
@@ -36,6 +38,8 @@ pub fn hosts() -> Result<Vec<Host>, String> {
     }
 }
 
+/// The JSON table (`{"<name>": {"src": …, "config": …}, …}`) as hosts, in
+/// name order.
 fn parse(bytes: &[u8]) -> Result<Vec<Host>, serde_json::Error> {
     let table: BTreeMap<String, Host> = serde_json::from_slice(bytes)?;
     Ok(table
