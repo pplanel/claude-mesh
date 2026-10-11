@@ -422,6 +422,8 @@ flowchart TD
 
 Every `CLAUDE_MESH_*` variable exists so tests (and debugging) can run three Macs in one machine: `CLAUDE_MESH_HOST` picks the identity, `CLAUDE_MESH_CONFIG_DIR` the folder, `CLAUDE_MESH_PEERS` replaces airshell routes with `tcp:` ones, `CLAUDE_MESH_ACTIVE_MS=0` turns off the 60 s window.
 
+Every round, against every peer, is also appended to the **round journal** (`src/journal.rs`, `state.rounds.jsonl` next to the state file): when it started, how long it took, any error, and each file with its action (`pulled`, `merged`, `conflict`, `busy`, `failed`), its bytes and whether it came as a tail. `claude-mesh report` summarizes it, and `claude-mesh status` adds what each peer still has to give (`sync::pending`, the first three decision steps without fetching).
+
 The log line is the main observability. Each round that changed anything says how much it fetched and how much came as tails:
 
 ```

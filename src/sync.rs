@@ -81,7 +81,49 @@ impl State {
     }
 }
 
-/// What one round against one peer did; logged when anything was written.
+/// What one round did to one file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    /// We didn't have it, or took the peer's version as is.
+    Pulled,
+    /// The result combines both sides (a log with two branches, the memory
+    /// index).
+    Merged,
+    /// Both sides changed it; the peer's version won and ours was saved as a
+    /// conflict copy (`note` names it).
+    Conflict,
+    /// Left for a later round (`note`: `recent` or `open session`).
+    Busy,
+    /// Couldn't be written here (`note` says why).
+    Failed,
+}
+
+/// One file's part in a round, as the journal records it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEvent {
+    /// The canonical path.
+    pub path: String,
+    /// What happened to it.
+    pub action: Action,
+    /// Bytes fetched for it (0 when nothing was fetched).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes: u64,
+    /// Whether it came as a tail (just a log's new bytes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail: bool,
+    /// A conflict copy's name, why it was busy, or the write error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// For `skip_serializing_if`.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// What one round against one peer did. Filled in as the round goes, so a
+/// round that breaks off still reports what it got done.
 #[derive(Default, Debug)]
 pub struct Report {
     /// Files we didn't have, or took as the peer's version.
@@ -98,9 +140,43 @@ pub struct Report {
     pub fetched: u64,
     /// Logs fetched as just their new lines.
     pub tails: usize,
+    /// Every file the round did something with, or left busy.
+    pub files: Vec<FileEvent>,
 }
 
-/// One round against one peer, over an open session `conn`.
+impl Report {
+    /// Count `event` and keep it.
+    fn record(&mut self, event: FileEvent) {
+        match event.action {
+            Action::Pulled => self.pulled += 1,
+            Action::Merged => self.merged += 1,
+            Action::Conflict => self.conflicts += 1,
+            Action::Busy => self.skipped_active += 1,
+            Action::Failed => self.failed += 1,
+        }
+        self.files.push(event);
+    }
+
+    /// Whether the round wrote anything or failed to (what's worth a log line).
+    pub fn wrote_anything(&self) -> bool {
+        self.pulled + self.merged + self.conflicts + self.failed > 0
+    }
+}
+
+/// An event for `path` with no bytes, tail or note.
+fn event(path: &str, action: Action) -> FileEvent {
+    FileEvent {
+        path: path.to_string(),
+        action,
+        bytes: 0,
+        tail: false,
+        note: None,
+    }
+}
+
+/// One round against one peer, over an open session `conn`, recording into
+/// `report` as it goes. An error ends the round (the stream is broken), but
+/// what was done until then stays in `report` and in `state`.
 pub fn sync_peer(
     this_host: &str,
     peer: &str,
@@ -108,14 +184,14 @@ pub fn sync_peer(
     scanner: &Scanner,
     state: &mut State,
     peer_copies: &Path,
-) -> std::io::Result<Report> {
+    report: &mut Report,
+) -> std::io::Result<()> {
     let remote: Manifest = serde_json::from_slice(&conn.request("manifest")?)
         .map_err(|e| std::io::Error::other(format!("bad manifest from {peer}: {e}")))?;
     let local = scanner.manifest();
     let canon = scanner.canon();
     let now = now_ms();
     let live = live_sessions(scanner.root());
-    let mut report = Report::default();
 
     for (rel, theirs) in &remote {
         let seen = state.seen.entry(peer.to_string()).or_default();
@@ -133,24 +209,35 @@ pub fn sync_peer(
         let Some(path) = scanner.local_path(&local_rel) else {
             continue;
         };
-        if is_active(&path, now) || belongs_to(&local_rel, &live) {
-            report.skipped_active += 1;
+        if belongs_to(&local_rel, &live) || is_active(&path, now) {
+            let why = if belongs_to(&local_rel, &live) {
+                "open session"
+            } else {
+                "recent"
+            };
+            report.record(FileEvent {
+                note: Some(why.into()),
+                ..event(rel, Action::Busy)
+            });
             continue;
         }
 
-        let remote_bytes =
+        let (remote_bytes, fetched, tail) =
             match fetch_tail(conn, rel, ours.is_some(), scanner, theirs, peer_copies)? {
-                Some((bytes, tail_len)) => {
-                    report.tails += 1;
-                    report.fetched += tail_len as u64;
-                    bytes
-                }
+                Some((bytes, tail_len)) => (bytes, tail_len as u64, true),
                 None => {
                     let bytes = conn.file(rel)?;
-                    report.fetched += bytes.len() as u64;
-                    bytes
+                    let n = bytes.len() as u64;
+                    (bytes, n, false)
                 }
             };
+        report.fetched += fetched;
+        report.tails += usize::from(tail);
+        let fetched_event = |action| FileEvent {
+            bytes: fetched,
+            tail,
+            ..event(rel, action)
+        };
         if blake3::hash(&remote_bytes).to_hex().as_str() != theirs.hash {
             // The peer's file changed between its manifest and our fetch;
             // the next round will see the new hash.
@@ -193,6 +280,7 @@ pub fn sync_peer(
         // A file that can't be written here (a name too long for this
         // layout, a permission) is logged and skipped, not the whole round.
         // It counts as seen, so it's retried when the peer's copy changes.
+        let mut conflict_copy = None;
         let written = (|| -> std::io::Result<Option<bool>> {
             // A conflict copy that itself conflicts isn't copied again: that
             // would nest (`x.conflict-a.conflict-a…`) a little more each round.
@@ -203,8 +291,8 @@ pub fn sync_peer(
                 let conflict_rel = conflict_name(&local_rel, this_host);
                 if let Some(cpath) = scanner.local_path(&conflict_rel) {
                     write_atomic(&cpath, &canon.content_from_canonical(&local_rel, mine))?;
-                    report.conflicts += 1;
                     log!("conflict on {rel}: kept {peer}'s version, ours saved as {conflict_rel}");
+                    conflict_copy = Some(conflict_rel);
                 }
             }
             if local_bytes.as_deref() == Some(result.as_slice()) {
@@ -218,14 +306,26 @@ pub fn sync_peer(
         })();
         match written {
             Ok(None) => {
-                report.skipped_active += 1;
+                report.record(FileEvent {
+                    note: Some("recent".into()),
+                    ..fetched_event(Action::Busy)
+                });
                 continue;
             }
-            Ok(Some(true)) if local_bytes.is_none() || result == remote_bytes => report.pulled += 1,
-            Ok(Some(true)) => report.merged += 1,
+            Ok(_) if conflict_copy.is_some() => report.record(FileEvent {
+                note: conflict_copy,
+                ..fetched_event(Action::Conflict)
+            }),
+            Ok(Some(true)) if local_bytes.is_none() || result == remote_bytes => {
+                report.record(fetched_event(Action::Pulled));
+            }
+            Ok(Some(true)) => report.record(fetched_event(Action::Merged)),
             Ok(Some(false)) => {}
             Err(e) => {
-                report.failed += 1;
+                report.record(FileEvent {
+                    note: Some(e.to_string()),
+                    ..fetched_event(Action::Failed)
+                });
                 log!("{peer}: can't write {local_rel}: {e}");
                 state
                     .seen
@@ -258,7 +358,55 @@ pub fn sync_peer(
             .local
             .insert(rel.clone(), blake3::hash(&ours_now).to_hex().to_string());
     }
-    Ok(report)
+    Ok(())
+}
+
+/// What a round against a peer would still have to do, from its manifest,
+/// without fetching anything: see [`pending`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pending {
+    /// Files the next round would fetch.
+    pub files: usize,
+    /// Their size on the peer (its layout; a tail fetches less).
+    pub bytes: u64,
+    /// Files the next round would leave alone (recent or an open session's).
+    pub busy: usize,
+    /// Files we have that the peer doesn't, or has differently: roughly what
+    /// the peer will pull from us.
+    pub theirs_to_pull: usize,
+}
+
+/// How far this Mac is from `peer`, given the peer's manifest `remote`: the
+/// first three steps of [`sync_peer`] (seen, same, busy), nothing fetched.
+pub fn pending(peer: &str, remote: &Manifest, scanner: &Scanner, state: &State) -> Pending {
+    let local = scanner.manifest();
+    let canon = scanner.canon();
+    let live = live_sessions(scanner.root());
+    let now = now_ms();
+    let seen = state.seen.get(peer);
+    let mut p = Pending::default();
+    for (rel, theirs) in remote {
+        if seen.and_then(|s| s.get(rel)) == Some(&theirs.hash)
+            || local.get(rel).is_some_and(|o| o.hash == theirs.hash)
+        {
+            continue;
+        }
+        let local_rel = canon.rel_from_canonical(rel);
+        let Some(path) = scanner.local_path(&local_rel) else {
+            continue;
+        };
+        if belongs_to(&local_rel, &live) || is_active(&path, now) {
+            p.busy += 1;
+        } else {
+            p.files += 1;
+            p.bytes += theirs.size;
+        }
+    }
+    p.theirs_to_pull = local
+        .iter()
+        .filter(|(rel, ours)| remote.get(*rel).is_none_or(|t| t.hash != ours.hash))
+        .count();
+    p
 }
 
 /// A log that only grew on the peer: fetch just the new bytes. The base is

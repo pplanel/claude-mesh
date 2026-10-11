@@ -37,7 +37,8 @@ tail -f ~/Library/Logs/claude-mesh.log
 |---|---|
 | `claude-mesh serve [--interval SECS]` | Serve this Mac's state on `127.0.0.1:7480`, register it with airshell-proxy, and pull from peers forever (default every 30 s). This is what launchd runs. |
 | `claude-mesh once` | One pull round against every peer, then exit. |
-| `claude-mesh status` | This Mac, its config folder, how many files it syncs, and whether each peer answers. |
+| `claude-mesh status` | This Mac and each peer: whether it answers, how many files and bytes are still to pull from it, how many are busy, and its last round. |
+| `claude-mesh report [--since 1h] [--peer NAME] [--files]` | What recent rounds did, from the journal: totals per peer, traffic per hour, the files that moved the most, the latest merges, conflicts and failures; `--files` lists every file. |
 | `claude-mesh register` | Add this Mac's `[[service]]` to airshell-proxy through its control socket, then exit. |
 
 ## Docs

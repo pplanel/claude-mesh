@@ -18,6 +18,12 @@
 
 The airshell side is in airshell-proxy's log: `grep claudesync ~/Library/Logs/airshell-proxy.err.log | tail`. Each connection from a peer shows as `client allowed … fingerprint=<peer>`, then `accepted` and `closed` with the bytes moved.
 
+## Statistics
+
+- **`claude-mesh status`**: per peer, whether it answers, what the next round would still fetch from it (files and bytes), what's busy, and its last round. It reads the peer's manifest and nothing else.
+- **`claude-mesh report [--since 1h] [--peer NAME] [--files]`**: from the round journal (`~/.local/state/claude-mesh/state.rounds.jsonl`, rotated at 8 MiB): rounds, errors, durations, bytes and tails per peer; bytes per hour; the files that moved the most; the latest merges, conflicts, failures and failed rounds. `--files` lists every file event.
+- The journal is JSON lines, so `jq` works too: `jq -c 'select(.error)' ~/.local/state/claude-mesh/state.rounds.jsonl`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

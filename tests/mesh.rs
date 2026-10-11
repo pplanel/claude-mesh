@@ -121,6 +121,17 @@ fn converge(mesh: &Mesh) {
     }
 }
 
+/// The latest round Mac `i` journaled against `peer`, as JSON.
+fn last_round(mesh: &Mesh, i: usize, peer: &str) -> serde_json::Value {
+    let journal = mesh.dirs[i].with_extension("state.rounds.jsonl");
+    std::fs::read_to_string(&journal)
+        .unwrap_or_else(|e| panic!("{}: {e}", journal.display()))
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|r| r["peer"] == peer)
+        .unwrap_or_else(|| panic!("no round against {peer} in {}", journal.display()))
+}
+
 fn write(dir: &Path, rel: &str, content: &str) {
     let p = dir.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -317,14 +328,15 @@ fn a_grown_log_is_fetched_as_its_tail() {
     // The session goes on on caladan: one more line.
     let grown = format!("{first}{}\n", line(2000));
     write(&mesh.dirs[1], key, &grown);
-    let out = command(&mesh, 0, &["once"]).output().unwrap();
-    let log = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        log.contains("caladan: pulled 1") && log.contains("(1 as tails)"),
-        "{log}"
+    command(&mesh, 0, &["once"]).status().unwrap();
+    let r = last_round(&mesh, 0, "caladan");
+    assert_eq!(
+        (r["pulled"].as_u64(), r["tails"].as_u64()),
+        (Some(1), Some(1)),
+        "{r}"
     );
     // About one line, not the ~450 KiB file.
-    assert!(log.contains("fetched 1 KiB"), "{log}");
+    assert!(r["fetched"].as_u64().unwrap() < 2048, "{r}");
     assert_eq!(read(&mesh.dirs[0], key), grown);
 }
 
@@ -374,12 +386,10 @@ fn a_diverged_log_that_keeps_growing_still_comes_as_tails() {
     once(1); // caladan merges arrakis's branch in, and keeps arrakis's copy
     // arrakis goes on writing, never pulling.
     write(&mesh.dirs[0], key, &format!("{ab}{}\n", line("d", "03")));
-    let log = once(1);
-    let arrakis = log.lines().find(|l| l.contains("arrakis:")).unwrap_or("");
-    assert!(
-        arrakis.contains("(1 as tails)") && arrakis.contains("fetched 1 KiB"),
-        "{log}"
-    );
+    once(1);
+    let r = last_round(&mesh, 1, "arrakis");
+    assert_eq!(r["tails"].as_u64(), Some(1), "{r}");
+    assert!(r["fetched"].as_u64().unwrap() < 2048, "{r}");
     let got = read(&mesh.dirs[1], key);
     for id in ["a", "b", "c", "d"] {
         assert!(
@@ -409,12 +419,10 @@ fn a_log_that_reads_back_differently_still_grows_by_tails() {
     };
     once(2);
     write(&mesh.dirs[0], key, &format!("{first}{}\n", line(500)));
-    let log = once(2);
-    let arrakis = log.lines().find(|l| l.contains("arrakis:")).unwrap_or("");
-    assert!(
-        arrakis.contains("(1 as tails)") && arrakis.contains("fetched 1 KiB"),
-        "{log}"
-    );
+    once(2);
+    let r = last_round(&mesh, 2, "arrakis");
+    assert_eq!(r["tails"].as_u64(), Some(1), "{r}");
+    assert!(r["fetched"].as_u64().unwrap() < 2048, "{r}");
 }
 
 #[test]
@@ -442,4 +450,64 @@ fn an_open_sessions_transcript_is_left_alone_however_quiet() {
     open.wait().unwrap();
     command(&mesh, 0, &["once"]).status().unwrap();
     assert!(read(&mesh.dirs[0], key).contains(r#""uuid":"c""#));
+}
+
+#[test]
+fn rounds_are_journaled_and_reported() {
+    let mesh = start();
+    write(&mesh.dirs[1], "plans/p.md", "plan");
+    write(
+        &mesh.dirs[1],
+        "projects/-Users-pplanel/s.jsonl",
+        "{\"uuid\":\"1\"}\n",
+    );
+    // Before pulling, status says what's left to fetch from caladan.
+    let out = command(&mesh, 0, &["status"]).output().unwrap();
+    let status = String::from_utf8_lossy(&out.stdout);
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("caladan"))
+        .unwrap_or_default();
+    assert!(line.contains(" yes ") && line.contains("2 ("), "{status}");
+
+    command(&mesh, 0, &["once"]).status().unwrap();
+    let r = last_round(&mesh, 0, "caladan");
+    assert_eq!(r["pulled"].as_u64(), Some(2), "{r}");
+    let paths: Vec<&str> = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"plans/p.md"), "{r}");
+
+    // Afterwards nothing is left, and the report lists the round and files.
+    let out = command(&mesh, 0, &["status"]).output().unwrap();
+    let status = String::from_utf8_lossy(&out.stdout);
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("caladan"))
+        .unwrap_or_default();
+    assert!(line.contains("0 (0 B)"), "{status}");
+    let out = command(&mesh, 0, &["report", "--since", "1h", "--files"])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains("caladan") && report.contains("pulled   plans/p.md"),
+        "{report}"
+    );
+    // A peer that can't be reached is journaled as a failed round.
+    let out = command(&mesh, 0, &["once"])
+        .env("CLAUDE_MESH_PEERS", "nowhere=false")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        last_round(&mesh, 0, "nowhere")["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("unreachable")),
+        "{:?}",
+        last_round(&mesh, 0, "nowhere")
+    );
 }

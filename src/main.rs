@@ -25,6 +25,7 @@
 //! 4. [`airshell`] and [`wire`]: how a Mac reaches a peer, and what they say.
 //! 5. [`sync`]: what a Mac does with each file a peer has.
 //! 6. [`merge`]: how two versions become one, the same way on every Mac.
+//!    [`journal`] records what each round did, for `report` and `status`.
 //! 7. This file: the commands, the round loop, the environment.
 //!
 //! `docs/codebase.md` walks the same path with diagrams; `docs/design.md`
@@ -38,6 +39,7 @@
 //! | `once`     | [`once`]: one pull round against every peer                    |
 //! | `status`   | [`status`]: this Mac, and whether each peer answers            |
 //! | `register` | [`register`]: add this Mac's service to airshell-proxy         |
+//! | `report`   | [`report`]: what recent rounds did, from the [`journal`]        |
 
 // Every item documented, private ones included: `cargo doc
 // --document-private-items` is the code's reference.
@@ -52,6 +54,7 @@ macro_rules! log {
 
 mod airshell;
 mod canon;
+mod journal;
 mod layout;
 mod merge;
 mod scan;
@@ -77,6 +80,9 @@ usage:
   claude-mesh once                      pull from every peer once, then exit
   claude-mesh status                    show this Mac, its peers, and whether they answer
   claude-mesh register                  add this Mac's service to airshell-proxy, then exit
+  claude-mesh report [--since 1h] [--peer NAME] [--files]
+                                        what recent rounds fetched, merged and couldn't do
+                                        (from the journal; --since defaults to 24h)
 
 environment:
   CLAUDE_MESH_LAYOUT      the layout table (default: /etc/claude-mesh/hosts.json)
@@ -96,6 +102,7 @@ fn main() {
         Some("once") => once(),
         Some("status") => status(),
         Some("register") => register(),
+        Some("report") => report(&args[1..]),
         _ => {
             eprint!("{USAGE}");
             2
@@ -181,40 +188,57 @@ fn node() -> Result<Node, String> {
 /// changed, save the state. An unreachable peer is logged and skipped.
 fn round(node: &Node) {
     let mut state = State::load(&node.state_path);
+    let journal = journal::path_for(&node.state_path);
     for peer in &node.peers {
-        let mut conn = match Peer::connect(&peer.route) {
-            Ok(conn) => conn,
+        let started = now_ms();
+        let mut report = sync::Report::default();
+        let error = match Peer::connect(&peer.route) {
             Err(e) => {
                 log!("{}: unreachable ({e})", peer.name);
-                continue;
+                Some(format!("unreachable: {e}"))
             }
+            Ok(mut conn) => sync::sync_peer(
+                &node.host.name,
+                &peer.name,
+                &mut conn,
+                &node.scanner,
+                &mut state,
+                // Next to the state file (state.peers/<peer>), never inside
+                // the synced folder.
+                &node.state_path.with_extension("peers").join(&peer.name),
+                &mut report,
+            )
+            .err()
+            .map(|e| {
+                log!("{}: {e}", peer.name);
+                e.to_string()
+            }),
         };
-        match sync::sync_peer(
-            &node.host.name,
-            &peer.name,
-            &mut conn,
-            &node.scanner,
-            &mut state,
-            // Next to the state file (state.peers/<peer>), never inside the
-            // synced folder.
-            &node.state_path.with_extension("peers").join(&peer.name),
-        ) {
-            Ok(r) if r.pulled + r.merged + r.conflicts + r.failed > 0 => log!(
-                "{}: pulled {}, merged {}, conflicts {}, busy {}, failed {}, fetched {} KiB ({} as tails)",
+        if report.wrote_anything() {
+            log!(
+                "{}: pulled {}, merged {}, conflicts {}, busy {}, failed {}, fetched {} ({} as tails)",
                 peer.name,
-                r.pulled,
-                r.merged,
-                r.conflicts,
-                r.skipped_active,
-                r.failed,
-                r.fetched.div_ceil(1024),
-                r.tails
-            ),
-            Ok(_) => {}
-            Err(e) => log!("{}: {e}", peer.name),
+                report.pulled,
+                report.merged,
+                report.conflicts,
+                report.skipped_active,
+                report.failed,
+                journal::bytes(report.fetched),
+                report.tails
+            );
         }
         if let Err(e) = state.save(&node.state_path) {
             log!("can't save state to {}: {e}", node.state_path.display());
+        }
+        let round = journal::Round::new(
+            started,
+            &peer.name,
+            now_ms().saturating_sub(started),
+            report,
+            error,
+        );
+        if let Err(e) = journal::append(&journal, &round) {
+            log!("can't write the journal {}: {e}", journal.display());
         }
     }
 }
@@ -286,13 +310,88 @@ fn status() -> i32 {
     println!("config:    {}", node.host.config.display());
     println!("state:     {}", node.state_path.display());
     println!("files:     {}", node.scanner.manifest().len());
+    let state = State::load(&node.state_path);
+    let rounds = journal::read(&journal::path_for(&node.state_path), 0);
+    println!(
+        "\n{:<10} {:<9} {:>14} {:>6} {:>13}  LAST ROUND",
+        "PEER", "ANSWERS", "TO PULL", "BUSY", "IT LACKS"
+    );
     for peer in &node.peers {
-        let answer = match Peer::connect(&peer.route) {
-            Ok(conn) => conn.health.clone(),
-            Err(e) => format!("not reachable: {e}"),
+        let last =
+            rounds
+                .iter()
+                .rev()
+                .find(|r| r.peer == peer.name)
+                .map_or("none yet".to_string(), |r| {
+                    format!(
+                        "{}, {}{}",
+                        journal::datetime(r.at),
+                        journal::bytes(r.fetched),
+                        r.error.as_ref().map_or(String::new(), |e| format!(", {e}"))
+                    )
+                });
+        let (answers, pending) = match Peer::connect(&peer.route) {
+            Err(e) => (format!("no ({e})"), None),
+            Ok(mut conn) => {
+                let remote: Option<scan::Manifest> = conn
+                    .request("manifest")
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                (
+                    "yes".to_string(),
+                    remote.map(|m| sync::pending(&peer.name, &m, &node.scanner, &state)),
+                )
+            }
         };
-        println!("peer {:<9} {answer}", peer.name);
+        match pending {
+            Some(p) => println!(
+                "{:<10} {:<9} {:>14} {:>6} {:>13}  {last}",
+                peer.name,
+                answers,
+                format!("{} ({})", p.files, journal::bytes(p.bytes)),
+                p.busy,
+                format!("~{} files", p.theirs_to_pull),
+            ),
+            None => println!("{:<10} {answers}  last round: {last}", peer.name),
+        }
     }
+    println!(
+        "\nTO PULL: files the next round fetches from the peer (their size; tails fetch less)."
+    );
+    println!("BUSY: left for later (written in the last minute, or an open session's).");
+    println!("IT LACKS: files here the peer doesn't have the same; it pulls them on its rounds.");
+    0
+}
+
+/// `report [--since DUR] [--peer NAME] [--files]`: what the journal says
+/// about recent rounds; see [`journal::render`].
+fn report(args: &[String]) -> i32 {
+    let node = match node() {
+        Ok(n) => n,
+        Err(e) => return fail(&e),
+    };
+    let value = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let window = match value("--since") {
+        None => 86_400_000,
+        Some(d) => match journal::parse_duration(&d) {
+            Some(ms) => ms,
+            None => return fail(&format!("--since {d}: use e.g. 30m, 2h, 1d")),
+        },
+    };
+    let since = now_ms().saturating_sub(window);
+    let rounds = journal::read(&journal::path_for(&node.state_path), since);
+    print!(
+        "{}",
+        journal::render(
+            &rounds,
+            &journal::Options {
+                since,
+                peer: value("--peer"),
+                files: args.iter().any(|a| a == "--files"),
+                host: node.host.name.clone(),
+            }
+        )
+    );
     0
 }
 
@@ -323,6 +422,14 @@ fn listen_port(listen: &str) -> u16 {
 fn fail(msg: &str) -> i32 {
     eprintln!("claude-mesh: {msg}");
     1
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `[<unix seconds>]`, the prefix of every log line.
