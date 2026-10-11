@@ -196,3 +196,20 @@ fn a_command_route_carries_the_stream() {
     assert!(st.success());
     assert_eq!(read(&mesh.dirs[0], "plans/q.md"), "via a command");
 }
+
+#[test]
+fn a_file_that_cant_be_written_doesnt_stop_the_round() {
+    // A name that fits on caladan but not on arrakis, whose project folder is
+    // longer (`-Users-pplanel-src-pplanel-…`): only that file is skipped.
+    let mesh = start();
+    let long = "x".repeat(255 - "-Users-pplanel-src-".len());
+    write(
+        &mesh.dirs[1],
+        &format!("projects/-Users-pplanel-src-{long}/s.jsonl"),
+        "{}\n",
+    );
+    write(&mesh.dirs[1], "plans/ok.md", "still arrives");
+    let st = command(&mesh, 0, &["once"]).status().unwrap();
+    assert!(st.success());
+    assert_eq!(read(&mesh.dirs[0], "plans/ok.md"), "still arrives");
+}

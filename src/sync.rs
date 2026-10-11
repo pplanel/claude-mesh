@@ -71,6 +71,8 @@ pub struct Report {
     pub merged: usize,
     pub conflicts: usize,
     pub skipped_active: usize,
+    /// Files we couldn't write here (logged); retried when the peer's copy changes.
+    pub failed: usize,
 }
 
 /// One round against one peer, over an open session `conn`.
@@ -131,25 +133,44 @@ pub fn sync_peer(
             }
         };
 
-        if conflict && let Some(mine) = &local_bytes {
-            let conflict_rel = conflict_name(&local_rel, this_host);
-            if let Some(cpath) = scanner.local_path(&conflict_rel) {
-                write_atomic(&cpath, &canon.content_from_canonical(&local_rel, mine))?;
-                report.conflicts += 1;
-                log!("conflict on {rel}: kept {peer}'s version, ours saved as {conflict_rel}");
+        // A file that can't be written here (a name too long for this
+        // layout, a permission) is logged and skipped, not the whole round.
+        // It counts as seen, so it's retried when the peer's copy changes.
+        let written = (|| -> std::io::Result<Option<bool>> {
+            if conflict && let Some(mine) = &local_bytes {
+                let conflict_rel = conflict_name(&local_rel, this_host);
+                if let Some(cpath) = scanner.local_path(&conflict_rel) {
+                    write_atomic(&cpath, &canon.content_from_canonical(&local_rel, mine))?;
+                    report.conflicts += 1;
+                    log!("conflict on {rel}: kept {peer}'s version, ours saved as {conflict_rel}");
+                }
             }
-        }
-
-        if local_bytes.as_deref() != Some(result.as_slice()) {
+            if local_bytes.as_deref() == Some(result.as_slice()) {
+                return Ok(Some(false));
+            }
             if is_active(&path, now_ms()) {
+                return Ok(None);
+            }
+            write_local(canon, &local_rel, &path, local_bytes.as_deref(), &result)?;
+            Ok(Some(true))
+        })();
+        match written {
+            Ok(None) => {
                 report.skipped_active += 1;
                 continue;
             }
-            write_local(canon, &local_rel, &path, local_bytes.as_deref(), &result)?;
-            if local_bytes.is_none() || result == remote_bytes {
-                report.pulled += 1;
-            } else {
-                report.merged += 1;
+            Ok(Some(true)) if local_bytes.is_none() || result == remote_bytes => report.pulled += 1,
+            Ok(Some(true)) => report.merged += 1,
+            Ok(Some(false)) => {}
+            Err(e) => {
+                report.failed += 1;
+                log!("{peer}: can't write {local_rel}: {e}");
+                state
+                    .seen
+                    .entry(peer.to_string())
+                    .or_default()
+                    .insert(rel.clone(), theirs.hash.clone());
+                continue;
             }
         }
         let seen = state.seen.entry(peer.to_string()).or_default();
@@ -213,11 +234,14 @@ fn write_local(
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
+    // Short whatever the target's name: a long name plus a prefix could pass
+    // the 255-byte limit. The scanner skips `.claude-mesh-*`.
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|n| n.as_encoded_bytes())
         .unwrap_or_default();
-    let tmp: PathBuf = dir.join(format!(".claude-mesh-{}-{name}", std::process::id()));
+    let tag = &blake3::hash(name).to_hex()[..16];
+    let tmp: PathBuf = dir.join(format!(".claude-mesh-{}-{tag}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
