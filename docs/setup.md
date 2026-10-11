@@ -1,24 +1,13 @@
 # Setting up claude-mesh on the Macs
 
-nix-darwin does most of it (`modules/darwin/claude-mesh.nix`): it runs `claude-mesh serve` at login as the user agent `dev.pplanel.claude-mesh` and writes the layout table to `/etc/claude-mesh/hosts.json`. What's left per Mac is building the binary and pairing the Macs in airshell.
+[claude-code-nix](https://github.com/pplanel/claude-code-nix) does most of it: `programs.claude-code-nix.mesh.enable = true` (nix-darwin sets it next to the handoff) installs the `claude-mesh` binary from this repo's flake, runs `claude-mesh serve` at login as the launchd agent `org.nix-community.home.claude-mesh`, and hands it the layout table made from `handoff.hosts`. What's left per Mac is pairing the Macs in airshell.
 
 ## Before you start
 
-- **airshell-proxy running as a user agent** (`airshell.nix`), with its control socket (airshell from AIR-53 on). Check: `ls "$(getconf DARWIN_USER_TEMP_DIR)"airshell-proxy.sock`.
-- **The repo on each Mac.** src-sync keeps it at `~/src/pplanel/claude-mesh` on arrakis and `~/src/claude-mesh` elsewhere.
+- **airshell-proxy running as a user agent** (nix-darwin's `airshell.nix`), with its control socket (airshell from AIR-53 on). Check: `ls "$(getconf DARWIN_USER_TEMP_DIR)"airshell-proxy.sock`.
 - **You don't need all three Macs.** Two Macs are a valid mesh; a Mac that's away is skipped until it's back.
 
-## 1. Build
-
-```sh
-cd ~/src/claude-mesh          # ~/src/pplanel/claude-mesh on arrakis
-cargo build --release
-./target/release/claude-mesh status
-```
-
-`status` prints this Mac's name and its Claude config folder (from the layout table), then asks each peer for `health`.
-
-## 2. Pair the Macs in airshell
+## 1. Pair the Macs in airshell
 
 airshell admits only Macs listed in `~/.config/airshell/authorized_peers`. Each Mac must list the other two.
 
@@ -38,12 +27,12 @@ The file is read on every connection, so it applies immediately. A peer's certif
 
 When the Macs join an airshell mesh, this step goes away: a QUIC service with no `allow` rule admits the devices of its own member, which is all three Macs.
 
-## 3. Start it
+## 2. Start it
 
-With nix-darwin, it starts at login; after building, restart it:
+The agent starts at login and after every switch. To restart it by hand:
 
 ```sh
-launchctl kickstart -k gui/$(id -u)/dev.pplanel.claude-mesh
+launchctl kickstart -k gui/$(id -u)/org.nix-community.home.claude-mesh
 ```
 
 On start, `serve` adds its service to airshell-proxy through the control socket. The log says so:
@@ -53,13 +42,13 @@ On start, `serve` adds its service to airshell-proxy through the control socket.
 [1791745142] airshell: added arrakis-claudesync to /Users/pplanel/.config/airshell/config.toml (started ["arrakis-claudesync"])
 ```
 
-`claude-mesh register` does only that step, for checking. The first time it dials a peer, macOS may ask whether claude-mesh can find devices on the local network: allow it.
+`claude-mesh register` does only that step, for checking. The first time it dials a peer, macOS may ask whether claude-mesh can find devices on the local network: allow it. It asks again when the binary's path changes (an upgrade), unless `mesh.executable` points at a signed copy at a stable path.
 
-## 4. Check
+## 3. Check
 
 ```sh
 dns-sd -B _claudesync._udp            # the other Macs' services (Ctrl-C to stop)
-./target/release/claude-mesh status
+claude-mesh status
 # peer caladan   {"host":"caladan","version":"0.1.0"}
 # peer imperium  {"host":"imperium","version":"0.1.0"}
 tail -f ~/Library/Logs/claude-mesh.log
@@ -79,6 +68,11 @@ tar czf ~/claude-backups/claude-arrakis-$(date +%F).tgz -C ~/src/pplanel .claude
 
 Then enable the Macs one at a time and watch the log.
 
-## Without nix-darwin
+## Without nix
 
-Run `./target/release/claude-mesh serve` from a terminal (not from an ssh session: processes started over ssh don't get the Local Network grant, so they can serve but not dial). Without `/etc/claude-mesh/hosts.json`, the built-in layout table is used; `CLAUDE_MESH_LAYOUT` points at another file.
+```sh
+cargo build --release
+./target/release/claude-mesh serve
+```
+
+Run it from a terminal, not from an ssh session: processes started over ssh don't get the Local Network grant, so they can serve but not dial. Without `CLAUDE_MESH_LAYOUT`, it reads `/etc/claude-mesh/hosts.json`, then falls back to a built-in copy of the table.

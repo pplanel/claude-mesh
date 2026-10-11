@@ -25,7 +25,7 @@ Later, `claude-mesh` can link `airshell-net` (its `NwQuicListener`/`NwQuicDialer
 
 ## Layout
 
-Where each Mac keeps its sources and its personal Claude config comes from `/etc/claude-mesh/hosts.json`, which nix-darwin writes from the same `hosts.nix` as `claude-handoff`, so the two can't disagree (`src/layout.rs`). Without the file, a built-in copy of the table is used.
+Where each Mac keeps its sources and its personal Claude config comes from the file `CLAUDE_MESH_LAYOUT` names. claude-code-nix makes it from `handoff.hosts`, the same table `claude-handoff` uses, so the two can't disagree (`src/layout.rs`). Without the variable, `/etc/claude-mesh/hosts.json` is read, then a built-in copy of the table.
 
 | Mac | Sources | Claude config |
 |---|---|---|

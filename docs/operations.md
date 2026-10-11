@@ -27,7 +27,7 @@ The airshell side is in airshell-proxy's log: `grep claudesync ~/Library/Logs/ai
 | `status`: `not reachable: … add the output of airshell-connect --print-fingerprint there` | This Mac isn't in the peer's `authorized_peers` | [setup step 2](setup.md#2-pair-the-macs-in-airshell) |
 | `not reachable: connection closed` from `serve`, while `status` in a terminal works | `serve` was started from an ssh session, which has no Local Network grant: it can serve but not dial | Run it under launchd (nix-darwin) or from a terminal on that Mac |
 | airshell log: `peer certificate changed; refusing` | A Mac's airshell identity was recreated | Remove its line from `~/.config/airshell/known_peers` if expected |
-| `status`: host isn't in the layout table | A new Mac or a different `hostname -s` | Add it to `claude/hosts.nix` in nix-darwin (or set `CLAUDE_MESH_HOST`) |
+| `status`: host isn't in the layout table | A new Mac or a different `hostname -s` | Add it to `handoff.hosts` (nix-darwin's `claude/hosts.nix`), or set `CLAUDE_MESH_HOST` |
 | A session appears twice in `claude --resume` | The same session diverged on two Macs (both kept, as branches) | Expected; resume either |
 | `*.conflict-<host>.*` files appear | Both Macs edited the same non-log file between syncs | Pick the right one, delete the other on **every** Mac (deletions don't sync) |
 
@@ -42,7 +42,7 @@ The airshell side is in airshell-proxy's log: `grep claudesync ~/Library/Logs/ai
 
 ## Removing it
 
-Remove `modules/darwin/claude-mesh.nix` from nix-darwin (it stops the agent everywhere once applied). Then, on each Mac:
+Set `programs.claude-code-nix.mesh.enable = false` (it stops the agent everywhere once applied). Then, on each Mac:
 
 ```sh
 # delete the <host>-claudesync [[service]] from ~/.config/airshell/config.toml

@@ -1,9 +1,9 @@
 //! Where each Mac keeps its sources and its Claude config.
 //!
-//! The table comes from `/etc/claude-mesh/hosts.json`, which nix-darwin writes
-//! from `modules/darwin/claude/hosts.nix`, the same table `claude-handoff`
-//! reads, so the two can't disagree. `CLAUDE_MESH_LAYOUT` points elsewhere;
-//! without either, a built-in copy is used (development only).
+//! The table comes from the file `CLAUDE_MESH_LAYOUT` names, which
+//! claude-code-nix makes from `handoff.hosts`, the same table `claude-handoff`
+//! reads, so the two can't disagree. Without it, `/etc/claude-mesh/hosts.json`;
+//! without either, a built-in copy (development only).
 //!
 //! ```json
 //! { "caladan": { "src": "/Users/pplanel/src", "config": "/Users/pplanel/.claude" } }

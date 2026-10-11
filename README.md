@@ -22,15 +22,13 @@ Today `claude-handoff` copies one session and its memory when you move it. `clau
 
 ## Quick start
 
-nix-darwin runs it on every Mac (`modules/darwin/claude-mesh.nix`). On **each** Mac (details and checks in [docs/setup.md](docs/setup.md)):
+[claude-code-nix](https://github.com/pplanel/claude-code-nix)'s `programs.claude-code-nix.mesh` runs it on every Mac as a launchd agent, with the hosts from its handoff table. Then on **each** Mac (details and checks in [docs/setup.md](docs/setup.md)):
 
 ```sh
-cd ~/src/claude-mesh                           # ~/src/pplanel/claude-mesh on arrakis
-cargo build --release
 # pair the Macs: each one's `airshell-connect --print-fingerprint` in the
-# others' ~/.config/airshell/authorized_peers (docs/setup.md, step 2)
-launchctl kickstart -k gui/$(id -u)/dev.pplanel.claude-mesh
-./target/release/claude-mesh status            # both peers should answer
+# others' ~/.config/airshell/authorized_peers (docs/setup.md, step 1)
+claude-mesh status            # both peers should answer
+tail -f ~/Library/Logs/claude-mesh.log
 ```
 
 ## Commands
