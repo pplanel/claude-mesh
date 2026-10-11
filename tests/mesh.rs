@@ -358,3 +358,31 @@ fn a_diverged_log_that_keeps_growing_still_comes_as_tails() {
         );
     }
 }
+
+#[test]
+fn a_log_that_reads_back_differently_still_grows_by_tails() {
+    // A session quoting a path that only arrakis rewrites: imperium's copy,
+    // read back, is never a prefix of arrakis's, even when nothing diverged.
+    let mesh = start();
+    let key = "projects/-Users-pplanel/paths.jsonl";
+    let line = |i: usize| {
+        format!(
+            r#"{{"uuid":"{i}","timestamp":"2026-10-11T10:00:00Z","t":"see /Users/pplanel/src/.claude {}"}}"#,
+            "z".repeat(300)
+        )
+    };
+    let first: String = (0..500).map(|i| line(i) + "\n").collect();
+    write(&mesh.dirs[0], key, &first);
+    let once = |i: usize| {
+        let out = command(&mesh, i, &["once"]).output().unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    once(2);
+    write(&mesh.dirs[0], key, &format!("{first}{}\n", line(500)));
+    let log = once(2);
+    let arrakis = log.lines().find(|l| l.contains("arrakis:")).unwrap_or("");
+    assert!(
+        arrakis.contains("(1 as tails)") && arrakis.contains("fetched 1 KiB"),
+        "{log}"
+    );
+}

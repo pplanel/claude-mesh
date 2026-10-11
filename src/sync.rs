@@ -213,16 +213,6 @@ pub fn sync_peer(
                 continue;
             }
         }
-        // A log that merged into something other than the peer's copy has
-        // diverged from it (two branches of a session). Keep the peer's copy,
-        // so its next growth can still come as a tail from there.
-        if rel.ends_with(".jsonl") {
-            if result == remote_bytes {
-                forget_peer_copy(peer_copies, rel);
-            } else {
-                keep_peer_copy(peer_copies, rel, &remote_bytes);
-            }
-        }
         let seen = state.seen.entry(peer.to_string()).or_default();
         seen.insert(rel.clone(), theirs.hash.clone());
         // Remember our copy's hash as the scanner will see it: rewriting paths
@@ -231,6 +221,17 @@ pub fn sync_peer(
         // canonical bytes than `result`. Recording `result`'s hash would make
         // the next round think we changed the file, and conflict forever.
         let ours_now = scanner.read_canonical(rel).unwrap_or(result);
+        // When our copy, read back, isn't the peer's (two branches of a
+        // session merged, or paths that read back differently in our layout),
+        // ours can't be the base for the peer's next tail. Keep the peer's
+        // copy for that; drop it once they're the same.
+        if rel.ends_with(".jsonl") {
+            if ours_now == remote_bytes {
+                forget_peer_copy(peer_copies, rel);
+            } else {
+                keep_peer_copy(peer_copies, rel, &remote_bytes);
+            }
+        }
         state
             .local
             .insert(rel.clone(), blake3::hash(&ours_now).to_hex().to_string());
