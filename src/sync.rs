@@ -73,6 +73,10 @@ pub struct Report {
     pub skipped_active: usize,
     /// Files we couldn't write here (logged); retried when the peer's copy changes.
     pub failed: usize,
+    /// Bytes fetched from the peer (file bodies, full or tails).
+    pub fetched: u64,
+    /// Logs fetched as just their new lines.
+    pub tails: usize,
 }
 
 /// One round against one peer, over an open session `conn`.
@@ -110,7 +114,18 @@ pub fn sync_peer(
             continue;
         }
 
-        let remote_bytes = conn.file(rel)?;
+        let remote_bytes = match fetch_tail(conn, rel, ours.is_some(), scanner, theirs)? {
+            Some((bytes, tail_len)) => {
+                report.tails += 1;
+                report.fetched += tail_len as u64;
+                bytes
+            }
+            None => {
+                let bytes = conn.file(rel)?;
+                report.fetched += bytes.len() as u64;
+                bytes
+            }
+        };
         if blake3::hash(&remote_bytes).to_hex().as_str() != theirs.hash {
             // The peer's file changed between its manifest and our fetch;
             // the next round will see the new hash.
@@ -208,6 +223,33 @@ pub fn sync_peer(
             .insert(rel.clone(), blake3::hash(&ours_now).to_hex().to_string());
     }
     Ok(report)
+}
+
+/// A log that only grew on the peer: fetch just the new bytes. Returns the
+/// peer's whole file (ours + the tail) and the tail's length, or `None` when
+/// that doesn't give the peer's hash (it diverged or shrank, or the peer is
+/// too old for `tail`), so the caller fetches it whole.
+fn fetch_tail(
+    conn: &mut Peer,
+    rel: &str,
+    have_ours: bool,
+    scanner: &Scanner,
+    theirs: &crate::scan::Entry,
+) -> std::io::Result<Option<(Vec<u8>, usize)>> {
+    if !have_ours || !rel.ends_with(".jsonl") {
+        return Ok(None);
+    }
+    let Some(mut mine) = scanner.read_canonical(rel) else {
+        return Ok(None);
+    };
+    let Ok(tail) = conn.tail(rel, mine.len()) else {
+        // `err`: an old peer, or the file shrank there. The stream is still
+        // in step (a whole response was read), so carry on with `file`.
+        return Ok(None);
+    };
+    let tail_len = tail.len();
+    mine.extend_from_slice(&tail);
+    Ok((blake3::hash(&mine).to_hex().as_str() == theirs.hash).then_some((mine, tail_len)))
 }
 
 /// Merge our canonical bytes with the peer's. Returns the result and whether

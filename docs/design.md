@@ -18,7 +18,7 @@ Claude Code on three Macs, three config folders, should feel like one computer a
 - **airshell owns identity, authentication and transport.** Each Mac's key lives in its Secure Enclave. airshell-proxy admits only paired Macs (`authorized_peers`, later mesh membership), pins their certificates (`known_peers`), encrypts with QUIC and picks the LAN or AWDL. `claude-mesh` handles no keys and opens no network sockets.
 - **Registration through the control socket.** On start, `serve` adds its `[[service]]` (`<host>-claudesync`, QUIC, `_claudesync._udp`, relayed to `127.0.0.1:7480`) to airshell-proxy with `config.get` + `config.apply` (`src/airshell.rs`). The proxy applies it at once; nobody edits `config.toml`.
 - **Dialing is a byte pipe.** For each peer, `serve` runs `airshell-connect <peer>-claudesync --transport quic` and talks over its stdin/stdout (`src/wire.rs`). No forwards, no port per peer.
-- **Pull-only.** A Mac only writes its own files. Peers answer three read-only requests on one stream per round, one per line: `health`, `manifest`, `file <hex path>`. Each answer is `ok <len>` or `err <len>`, then the bytes.
+- **Pull-only.** A Mac only writes its own files. Peers answer read-only requests on one stream per round, one per line: `health`, `manifest`, `file <hex path>`, and `tail <hex path> <offset>` for a log that grew. Each answer is `ok <len>` or `err <len>`, then the bytes.
 - **No coordinator.** Every Mac pulls from every other; there's no leader and nothing to elect.
 
 Later, `claude-mesh` can link `airshell-net` (its `NwQuicListener`/`NwQuicDialer`) instead of going through the proxy and `airshell-connect`; the protocol stays the same. That waits for airshell's mesh membership and for signing the binary like airshell's own, since it then needs its own Local Network grant.
@@ -90,5 +90,6 @@ Each merge is symmetric and idempotent (merging a result with either input gives
 ## Deliberately not done (yet)
 
 - **Deletions don't propagate.** Deleting a session or memory file on one Mac doesn't delete it elsewhere; it comes back from a peer. Safer for a first version; tombstones would fix it.
-- **Whole-file transfer.** A changed transcript is fetched whole. Fine at today's sizes (tens of MB in total); content-defined chunking is what shift-compute is for.
+- **No compression.** Bodies go as they are; QUIC encrypts but doesn't compress. Transcripts gzip about 4x.
+- **Only appends are incremental.** A log that grew is fetched as its tail: the client asks for the bytes past its own canonical length and checks that its copy plus the tail has the peer's hash, else fetches the whole file. Anything else changed is fetched whole; content-defined chunking is what shift-compute is for.
 - **No push.** Changes arrive within one interval (30 s), not instantly.

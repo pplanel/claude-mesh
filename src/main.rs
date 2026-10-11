@@ -141,13 +141,15 @@ fn round(node: &Node) {
             &mut state,
         ) {
             Ok(r) if r.pulled + r.merged + r.conflicts + r.failed > 0 => log!(
-                "{}: pulled {}, merged {}, conflicts {}, busy {}, failed {}",
+                "{}: pulled {}, merged {}, conflicts {}, busy {}, failed {}, fetched {} KiB ({} as tails)",
                 peer.name,
                 r.pulled,
                 r.merged,
                 r.conflicts,
                 r.skipped_active,
-                r.failed
+                r.failed,
+                r.fetched.div_ceil(1024),
+                r.tails
             ),
             Ok(_) => {}
             Err(e) => log!("{}: {e}", peer.name),

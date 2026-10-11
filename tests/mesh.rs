@@ -270,3 +270,48 @@ fn walk(dir: &Path) -> Vec<String> {
     }
     out
 }
+
+#[test]
+fn a_grown_log_is_fetched_as_its_tail() {
+    let mesh = start();
+    let key = "projects/-Users-pplanel/big.jsonl";
+    let line = |i: usize| {
+        format!(
+            r#"{{"uuid":"{i}","timestamp":"2026-10-11T10:00:00Z","pad":"{}"}}"#,
+            "x".repeat(200)
+        )
+    };
+    let first: String = (0..2000).map(|i| line(i) + "\n").collect();
+    write(&mesh.dirs[0], key, &first);
+    converge(&mesh);
+    // The session goes on on caladan: one more line.
+    let grown = format!("{first}{}\n", line(2000));
+    write(&mesh.dirs[1], key, &grown);
+    let out = command(&mesh, 0, &["once"]).output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        log.contains("caladan: pulled 1") && log.contains("(1 as tails)"),
+        "{log}"
+    );
+    // About one line, not the ~450 KiB file.
+    assert!(log.contains("fetched 1 KiB"), "{log}");
+    assert_eq!(read(&mesh.dirs[0], key), grown);
+}
+
+#[test]
+fn a_diverged_log_falls_back_to_the_whole_file() {
+    let mesh = start();
+    let key = "projects/-Users-pplanel/d.jsonl";
+    let a = r#"{"uuid":"a","timestamp":"2026-10-11T10:00:00Z"}"#;
+    let b = r#"{"uuid":"b","timestamp":"2026-10-11T10:01:00Z"}"#;
+    let c = r#"{"uuid":"c","timestamp":"2026-10-11T10:02:00Z"}"#;
+    write(&mesh.dirs[0], key, &format!("{a}\n"));
+    converge(&mesh);
+    // Each side adds its own line: not a prefix of each other any more.
+    write(&mesh.dirs[0], key, &format!("{a}\n{b}\n"));
+    write(&mesh.dirs[1], key, &format!("{a}\n{c}\n"));
+    converge(&mesh);
+    for d in &mesh.dirs {
+        assert_eq!(read(d, key), format!("{a}\n{b}\n{c}\n"), "{}", d.display());
+    }
+}

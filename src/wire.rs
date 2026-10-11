@@ -10,6 +10,7 @@
 //! | `health`      | `{"host": "...", "version": "..."}`             |
 //! | `manifest`    | the [`Manifest`](crate::scan::Manifest) as JSON |
 //! | `file <hex>`  | canonical bytes of the canonical path `<hex>`   |
+//! | `tail <hex> <offset>` | those bytes from `offset` on (a grown log) |
 //!
 //! Every response is a line `ok <len>` or `err <len>`, then `<len>` bytes.
 
@@ -72,6 +73,17 @@ fn answer(request: &str, host: &str, scanner: &Scanner) -> (bool, Vec<u8>) {
             Some(bytes) => (true, bytes),
             None => (false, b"not found".to_vec()),
         },
+        ("tail", args) => {
+            let tail = args.split_once(' ').and_then(|(hex, offset)| {
+                let bytes = scanner.read_canonical(&hex_decode(hex)?)?;
+                let offset: usize = offset.parse().ok()?;
+                bytes.get(offset..).map(<[u8]>::to_vec)
+            });
+            match tail {
+                Some(bytes) => (true, bytes),
+                None => (false, b"not found".to_vec()),
+            }
+        }
         _ => (false, b"unknown request".to_vec()),
     }
 }
@@ -198,6 +210,11 @@ impl Peer {
 
     pub fn file(&mut self, rel: &str) -> std::io::Result<Vec<u8>> {
         self.request(&format!("file {}", hex_encode(rel)))
+    }
+
+    /// The canonical bytes of `rel` from `offset` on.
+    pub fn tail(&mut self, rel: &str, offset: usize) -> std::io::Result<Vec<u8>> {
+        self.request(&format!("tail {} {offset}", hex_encode(rel)))
     }
 }
 
