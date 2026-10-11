@@ -16,9 +16,9 @@
 //!    starts writing again mid-sync never sees its file replaced.
 
 use crate::canon::Canon;
-use crate::http::{get, hex_encode};
 use crate::merge::{Strategy, last_writer_wins, merge_jsonl, merge_line_union, strategy_for};
 use crate::scan::{Manifest, Scanner, mtime_ms};
+use crate::wire::Peer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -73,15 +73,15 @@ pub struct Report {
     pub skipped_active: usize,
 }
 
-/// One round against one peer, reached at `addr` (its airshell forward).
+/// One round against one peer, over an open session `conn`.
 pub fn sync_peer(
     this_host: &str,
     peer: &str,
-    addr: &str,
+    conn: &mut Peer,
     scanner: &Scanner,
     state: &mut State,
 ) -> std::io::Result<Report> {
-    let remote: Manifest = serde_json::from_slice(&get(addr, "/manifest")?)
+    let remote: Manifest = serde_json::from_slice(&conn.request("manifest")?)
         .map_err(|e| std::io::Error::other(format!("bad manifest from {peer}: {e}")))?;
     let local = scanner.manifest();
     let canon = scanner.canon();
@@ -108,7 +108,7 @@ pub fn sync_peer(
             continue;
         }
 
-        let remote_bytes = get(addr, &format!("/file/{}", hex_encode(rel)))?;
+        let remote_bytes = conn.file(rel)?;
         if blake3::hash(&remote_bytes).to_hex().as_str() != theirs.hash {
             // The peer's file changed between its manifest and our fetch;
             // the next round will see the new hash.

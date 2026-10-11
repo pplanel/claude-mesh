@@ -1,55 +1,61 @@
-//! Where each Mac keeps its sources and its Claude config, and how the mesh
-//! reaches each peer.
+//! Where each Mac keeps its sources and its Claude config.
 //!
-//! The table mirrors `claude-handoff`'s `layout()`: arrakis keeps the personal
-//! Claude account under its source folder (`claude-personal` sets
-//! `CLAUDE_CONFIG_DIR`), the other Macs use `~/.claude`.
+//! The table comes from `/etc/claude-mesh/hosts.json`, which nix-darwin writes
+//! from `modules/darwin/claude/hosts.nix`, the same table `claude-handoff`
+//! reads, so the two can't disagree. `CLAUDE_MESH_LAYOUT` points elsewhere;
+//! without either, a built-in copy is used (development only).
+//!
+//! ```json
+//! { "caladan": { "src": "/Users/pplanel/src", "config": "/Users/pplanel/.claude" } }
+//! ```
 
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The TCP port `claude-mesh serve` listens on, on every Mac. airshell-proxy
-/// advertises it to the mesh as the QUIC service `<host>-claudesync`.
-pub const SERVE_PORT: u16 = 7480;
-
-/// The Bonjour service type the airshell service and forwards use.
-pub const SERVICE_TYPE: &str = "_claudesync._udp";
+pub const LAYOUT_FILE: &str = "/etc/claude-mesh/hosts.json";
 
 /// One Mac in the mesh.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Host {
+    #[serde(skip)]
     pub name: String,
     /// The user's source folder on this Mac.
     pub src: PathBuf,
     /// The Claude config folder on this Mac.
     pub config: PathBuf,
-    /// The local port where *other* Macs reach this one through an airshell
-    /// `[[forward]]`. Each peer gets its own port so every Mac can forward to
-    /// every other at once.
-    pub forward_port: u16,
 }
 
-/// The three Macs. Kept in one place so every node agrees.
-pub fn hosts() -> Vec<Host> {
+/// Every Mac, from the layout file (or the built-in table).
+pub fn hosts() -> Result<Vec<Host>, String> {
+    let path = std::env::var("CLAUDE_MESH_LAYOUT").unwrap_or_else(|_| LAYOUT_FILE.to_string());
+    match std::fs::read(&path) {
+        Ok(bytes) => parse(&bytes).map_err(|e| format!("{path}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(builtin()),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+fn parse(bytes: &[u8]) -> Result<Vec<Host>, serde_json::Error> {
+    let table: BTreeMap<String, Host> = serde_json::from_slice(bytes)?;
+    Ok(table
+        .into_iter()
+        .map(|(name, host)| Host { name, ..host })
+        .collect())
+}
+
+/// The table as of 2026-10-11, for running outside nix-darwin.
+pub fn builtin() -> Vec<Host> {
     let home = PathBuf::from("/Users/pplanel");
+    let host = |name: &str, src: &str, config: &str| Host {
+        name: name.into(),
+        src: home.join(src),
+        config: home.join(config),
+    };
     vec![
-        Host {
-            name: "arrakis".into(),
-            src: home.join("src/pplanel"),
-            config: home.join("src/pplanel/.claude"),
-            forward_port: 7481,
-        },
-        Host {
-            name: "caladan".into(),
-            src: home.join("src"),
-            config: home.join(".claude"),
-            forward_port: 7482,
-        },
-        Host {
-            name: "imperium".into(),
-            src: home.join("src"),
-            config: home.join(".claude"),
-            forward_port: 7483,
-        },
+        host("arrakis", "src/pplanel", "src/pplanel/.claude"),
+        host("caladan", "src", ".claude"),
+        host("imperium", "src", ".claude"),
     ]
 }
 
@@ -65,20 +71,17 @@ pub fn this_host_name() -> String {
     }
 }
 
-pub fn find(name: &str) -> Option<Host> {
-    hosts().into_iter().find(|h| h.name == name)
-}
-
-/// Every host except `name`.
-pub fn peers_of(name: &str) -> Vec<Host> {
-    hosts().into_iter().filter(|h| h.name != name).collect()
-}
-
 /// Claude names a project's folder after its path, with `/` and `.` turned into `-`.
 pub fn project_key(path: &str) -> String {
     path.chars()
         .map(|c| if c == '/' || c == '.' { '-' } else { c })
         .collect()
+}
+
+/// A built-in host by name, for unit tests.
+#[cfg(test)]
+pub fn find(name: &str) -> Option<Host> {
+    builtin().into_iter().find(|h| h.name == name)
 }
 
 #[cfg(test)]
@@ -98,11 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn every_host_has_a_distinct_forward_port() {
-        let mut ports: Vec<u16> = hosts().iter().map(|h| h.forward_port).collect();
-        ports.sort();
-        ports.dedup();
-        assert_eq!(ports.len(), hosts().len());
-        assert!(!ports.contains(&SERVE_PORT));
+    fn layout_file_parses_like_the_builtin_table() {
+        let json = r#"{
+          "arrakis":  {"src": "/Users/pplanel/src/pplanel", "config": "/Users/pplanel/src/pplanel/.claude"},
+          "caladan":  {"src": "/Users/pplanel/src", "config": "/Users/pplanel/.claude"},
+          "imperium": {"src": "/Users/pplanel/src", "config": "/Users/pplanel/.claude"}
+        }"#;
+        assert_eq!(parse(json.as_bytes()).unwrap(), builtin());
     }
 }

@@ -1,5 +1,6 @@
 //! End to end: three `claude-mesh` processes, one per Mac layout, each with
-//! its own Claude config folder, talking over localhost instead of airshell.
+//! its own Claude config folder, talking over localhost (`tcp:` routes)
+//! instead of airshell.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ fn free_port() -> u16 {
 fn command(mesh: &Mesh, i: usize, args: &[&str]) -> Command {
     let peers: Vec<String> = (0..3)
         .filter(|&j| j != i)
-        .map(|j| format!("{}=127.0.0.1:{}", HOSTS[j], mesh.ports[j]))
+        .map(|j| format!("{}=tcp:127.0.0.1:{}", HOSTS[j], mesh.ports[j]))
         .collect();
     let mut c = Command::new(env!("CARGO_BIN_EXE_claude-mesh"));
     c.args(args)
@@ -46,7 +47,7 @@ fn command(mesh: &Mesh, i: usize, args: &[&str]) -> Command {
             mesh.dirs[i].with_extension("state.json"),
         )
         .env("CLAUDE_MESH_LISTEN", format!("127.0.0.1:{}", mesh.ports[i]))
-        .env("CLAUDE_MESH_PEERS", peers.join(","))
+        .env("CLAUDE_MESH_PEERS", peers.join(";"))
         .env("CLAUDE_MESH_ACTIVE_MS", "0");
     c
 }
@@ -178,4 +179,20 @@ fn credentials_and_settings_never_leave_a_mac() {
     assert!(!mesh.dirs[1].join(".credentials.json").exists());
     assert!(!mesh.dirs[1].join("settings.json").exists());
     assert_eq!(read(&mesh.dirs[1], "plans/p.md"), "plan");
+}
+
+#[test]
+fn a_command_route_carries_the_stream() {
+    // What airshell-connect does, with nc: a process whose stdio is the stream.
+    let mesh = start();
+    write(&mesh.dirs[1], "plans/q.md", "via a command");
+    let st = command(&mesh, 0, &["once"])
+        .env(
+            "CLAUDE_MESH_PEERS",
+            format!("caladan=nc 127.0.0.1 {}", mesh.ports[1]),
+        )
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(read(&mesh.dirs[0], "plans/q.md"), "via a command");
 }
