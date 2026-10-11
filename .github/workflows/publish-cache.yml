@@ -1,0 +1,25 @@
+name: Publish Binary Cache
+
+# Builds this flake's aarch64-darwin outputs (claude-mesh) and pushes the signed
+# NARs to ghcr.io/pplanel/claude-mesh/nix-cache, so the Macs substitute the
+# binary instead of building it. The build logic lives once in pplanel/nixcache
+# as a reusable workflow; this is the thin caller. Public key: public-key.txt.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["docs/**", "*.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: pplanel/nixcache/.github/workflows/publish-cache.yml@main
+    secrets: inherit
+    # A pure build today, so a GitHub-hosted macOS runner (the default) does.
+    # Once claude-mesh links airshell-net (networkframework's Swift bridge,
+    # Xcode, an impure build) it moves to the self-hosted `airshell-builder`.
