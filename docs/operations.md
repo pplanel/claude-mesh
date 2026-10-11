@@ -5,8 +5,9 @@
 `serve` logs to stderr; under launchd that's `~/Library/Logs/claude-mesh.log`. It's quiet unless something happened:
 
 ```
-[1791480000] caladan: pulled 12, merged 1, conflicts 0, busy 2
-[1791480030] imperium (127.0.0.1:7483): Connection refused (os error 61)
+[1791745142] airshell: added arrakis-claudesync to /Users/pplanel/.config/airshell/config.toml (started ["arrakis-claudesync"])
+[1791745147] caladan: pulled 12, merged 1, conflicts 0, busy 2
+[1791745245] imperium: unreachable (connection closed)
 [1791480060] conflict on plans/x.md: kept imperium's version, ours saved as plans/x.conflict-arrakis.md
 ```
 
@@ -15,17 +16,18 @@
 - **conflicts**: our version lost and was saved as a `.conflict-<host>` copy.
 - **busy**: files skipped because they were written in the last minute; they're retried next round.
 
-The airshell side: `~/Library/Logs/airshell-proxy.json`, e.g. `jq -r 'select(.fields.service | tostring | test("claudesync"))' ~/Library/Logs/airshell-proxy.json`.
+The airshell side is in airshell-proxy's log: `grep claudesync ~/Library/Logs/airshell-proxy.err.log | tail`. Each connection from a peer shows as `client allowed … fingerprint=<peer>`, then `accepted` and `closed` with the bytes moved.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `status` shows a peer as `Connection refused` | The forward isn't in this Mac's airshell config, or the proxy hasn't reloaded | `claude-mesh airshell-config`, compare with `~/.config/airshell/config.toml` |
-| A peer request hangs ~30 s, then fails | Local Network not approved for airshell-proxy on one of the Macs, or the peer's `claude-mesh` isn't running | Approve the macOS prompt; `launchctl list \| grep claude-mesh` on the peer |
-| airshell log: `unknown client rejected` | This Mac isn't in the peer's `authorized_peers` | [setup step 3](setup.md#3-authorize-the-macs-to-each-other) |
+| Log: `airshell: can't register (… is airshell-proxy running?)` | The proxy isn't running, or is too old for the control socket | `launchctl list \| grep airshell`; peers can't reach this Mac until it registers (restart `serve` once the proxy is up) |
+| `status`: a peer is `not reachable: … not found` | The peer's `serve` isn't running, so its proxy doesn't advertise `<peer>-claudesync` | `dns-sd -B _claudesync._udp`; `launchctl list \| grep claude-mesh` on the peer |
+| `status`: `not reachable: … add the output of airshell-connect --print-fingerprint there` | This Mac isn't in the peer's `authorized_peers` | [setup step 2](setup.md#2-pair-the-macs-in-airshell) |
+| `not reachable: connection closed` from `serve`, while `status` in a terminal works | `serve` was started from an ssh session, which has no Local Network grant: it can serve but not dial | Run it under launchd (nix-darwin) or from a terminal on that Mac |
 | airshell log: `peer certificate changed; refusing` | A Mac's airshell identity was recreated | Remove its line from `~/.config/airshell/known_peers` if expected |
-| `status`: host isn't in the layout table | A new Mac or a different `hostname -s` | Add it to `hosts()` in `src/layout.rs` (or set `CLAUDE_MESH_HOST`) |
+| `status`: host isn't in the layout table | A new Mac or a different `hostname -s` | Add it to `claude/hosts.nix` in nix-darwin (or set `CLAUDE_MESH_HOST`) |
 | A session appears twice in `claude --resume` | The same session diverged on two Macs (both kept, as branches) | Expected; resume either |
 | `*.conflict-<host>.*` files appear | Both Macs edited the same non-log file between syncs | Pick the right one, delete the other on **every** Mac (deletions don't sync) |
 
@@ -35,15 +37,15 @@ The airshell side: `~/Library/Logs/airshell-proxy.json`, e.g. `jq -r 'select(.fi
 - **Path rewriting is textual.** Inside transcripts, every occurrence of this Mac's source and config paths is rewritten, including paths a conversation merely *quotes* (e.g. a transcript on caladan that mentions `/Users/pplanel/src/pplanel/...` as text will read `/Users/pplanel/src/pplanel/pplanel/...` on arrakis). `claude-handoff` rewrites paths the same textual way.
 - **Same session open on two Macs at once.** Both keep appending; the logs diverge and are merged as two branches. Claude resumes one branch; nothing is lost, but it's confusing. Use one Mac per session at a time, as with handoff.
 - **Local access.** The server binds `127.0.0.1` without auth: any process on this Mac can read the synced files through it. They are your own files under your account, already readable by those processes.
+- **Anyone airshell admits can read.** Every Mac in `authorized_peers` (or, later, every device of your mesh member) can fetch all synced files, including transcripts. Pair only your own Macs.
 - **Full rescans.** Each round lists the synced folders; unchanged files are hashed once and cached by (size, mtime).
+
 ## Removing it
 
-On each Mac:
+Remove `modules/darwin/claude-mesh.nix` from nix-darwin (it stops the agent everywhere once applied). Then, on each Mac:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/dev.pplanel.claude-mesh.plist
-rm ~/Library/LaunchAgents/dev.pplanel.claude-mesh.plist
-# delete the -claudesync [[service]] and [[forward]] entries from ~/.config/airshell/config.toml
+# delete the <host>-claudesync [[service]] from ~/.config/airshell/config.toml
 rm -r ~/.local/state/claude-mesh
 ```
 

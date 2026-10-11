@@ -2,22 +2,35 @@
 
 ## Goal
 
-Claude Code on three Macs, three accounts, should feel like one computer and one account: any session can be resumed anywhere, memory written on one Mac is known on the others, prompt history is shared. Without a server, and working over AWDL when the Macs have no network in common.
+Claude Code on three Macs, three config folders, should feel like one computer and one account: any session can be resumed anywhere, memory written on one Mac is known on the others, prompt history is shared. Without a server, and working over AWDL when the Macs have no network in common.
 
 ## Shape
 
 ```
-      ┌──────────── this Mac ────────────┐
-      │ claude-mesh serve                 │
-      │  ├─ HTTP on 127.0.0.1:7480 ◀──────┼── airshell [[service]] <me>-claudesync ◀── peers
-      │  └─ every 30 s, for each peer:    │
-      │       GET 127.0.0.1:748x ─────────┼──▶ airshell [[forward]] <peer>-claudesync ──▶ peer
-      └──────────────────────────────────┘
+      ┌──────────────── this Mac ─────────────────┐
+      │ claude-mesh serve                          │
+      │  ├─ 127.0.0.1:7480 ◀── airshell-proxy ◀────┼── QUIC from peers ("<me>-claudesync")
+      │  └─ every 30 s, for each peer:             │
+      │       airshell-connect <peer>-claudesync ──┼──▶ QUIC to the peer's proxy
+      └───────────────────────────────────────────┘
 ```
 
-- **Transport is airshell's problem.** `claude-mesh` speaks plain HTTP on localhost. airshell-proxy authenticates peers (each Mac's `authorized_peers`, certificate pinning in `known_peers`), encrypts with QUIC, and picks the LAN or AWDL. Nothing in `claude-mesh` handles keys or the network.
-- **Pull-only.** A Mac only writes its own files. Peers expose read-only routes (`/health`, `/manifest`, `/file/<hex path>`).
+- **airshell owns identity, authentication and transport.** Each Mac's key lives in its Secure Enclave. airshell-proxy admits only paired Macs (`authorized_peers`, later mesh membership), pins their certificates (`known_peers`), encrypts with QUIC and picks the LAN or AWDL. `claude-mesh` handles no keys and opens no network sockets.
+- **Registration through the control socket.** On start, `serve` adds its `[[service]]` (`<host>-claudesync`, QUIC, `_claudesync._udp`, relayed to `127.0.0.1:7480`) to airshell-proxy with `config.get` + `config.apply` (`src/airshell.rs`). The proxy applies it at once; nobody edits `config.toml`.
+- **Dialing is a byte pipe.** For each peer, `serve` runs `airshell-connect <peer>-claudesync --transport quic` and talks over its stdin/stdout (`src/wire.rs`). No forwards, no port per peer.
+- **Pull-only.** A Mac only writes its own files. Peers answer three read-only requests on one stream per round, one per line: `health`, `manifest`, `file <hex path>`. Each answer is `ok <len>` or `err <len>`, then the bytes.
 - **No coordinator.** Every Mac pulls from every other; there's no leader and nothing to elect.
+
+Later, `claude-mesh` can link `airshell-net` (its `NwQuicListener`/`NwQuicDialer`) instead of going through the proxy and `airshell-connect`; the protocol stays the same. That waits for airshell's mesh membership and for signing the binary like airshell's own, since it then needs its own Local Network grant.
+
+## Layout
+
+Where each Mac keeps its sources and its personal Claude config comes from `/etc/claude-mesh/hosts.json`, which nix-darwin writes from the same `hosts.nix` as `claude-handoff`, so the two can't disagree (`src/layout.rs`). Without the file, a built-in copy of the table is used.
+
+| Mac | Sources | Claude config |
+|---|---|---|
+| arrakis | `~/src/pplanel` | `~/src/pplanel/.claude` (`claude-personal`) |
+| caladan, imperium | `~/src` | `~/.claude` |
 
 ## What is synced
 
