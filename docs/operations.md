@@ -25,7 +25,7 @@ The airshell side is in airshell-proxy's log: `grep claudesync ~/Library/Logs/ai
 | Log: `airshell: can't register (… is airshell-proxy running?)` | The proxy isn't running, or is too old for the control socket | `launchctl list \| grep airshell`; peers can't reach this Mac until it registers (restart `serve` once the proxy is up) |
 | `status`: a peer is `not reachable: … not found` | The peer's `serve` isn't running, so its proxy doesn't advertise `<peer>-claudesync` | `dns-sd -B _claudesync._udp`; `launchctl list \| grep claude-mesh` on the peer |
 | `status`: `not reachable: … add the output of airshell-connect --print-fingerprint there` | This Mac isn't in the peer's `authorized_peers` | [setup step 2](setup.md#2-pair-the-macs-in-airshell) |
-| `not reachable: connection closed` from `serve`, while `status` in a terminal works | `serve` was started from an ssh session, which has no Local Network grant: it can serve but not dial | Run it under launchd (nix-darwin) or from a terminal on that Mac |
+| `unreachable (connection closed)` for every peer, while peers still pull from this Mac | macOS's prompt to allow claude-mesh's connections is waiting on this Mac's screen (it can serve, not dial) | Accept it on that Mac; the next round connects |
 | airshell log: `peer certificate changed; refusing` | A Mac's airshell identity was recreated | Remove its line from `~/.config/airshell/known_peers` if expected |
 | `status`: host isn't in the layout table | A new Mac or a different `hostname -s` | Add it to `handoff.hosts` (nix-darwin's `claude/hosts.nix`), or set `CLAUDE_MESH_HOST` |
 | A session appears twice in `claude --resume` | The same session diverged on two Macs (both kept, as branches) | Expected; resume either |

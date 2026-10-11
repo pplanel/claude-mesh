@@ -75,4 +75,4 @@ cargo build --release
 ./target/release/claude-mesh serve
 ```
 
-Run it from a terminal, not from an ssh session: processes started over ssh don't get the Local Network grant, so they can serve but not dial. Without `CLAUDE_MESH_LAYOUT`, it reads `/etc/claude-mesh/hosts.json`, then falls back to a built-in copy of the table.
+The first time it dials a peer, macOS asks on that Mac's screen whether claude-mesh may connect (the firewall's prompt): until someone accepts it there, it can serve but not dial, even when it was started over ssh. Without `CLAUDE_MESH_LAYOUT`, it reads `/etc/claude-mesh/hosts.json`, then falls back to a built-in copy of the table.
