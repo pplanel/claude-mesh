@@ -569,7 +569,7 @@ fn same_on_disk(canon: &Canon, local_rel: &str, path: &Path, remote: &[u8]) -> b
 
 /// Replace `path` with `bytes` in one step: write a temp file next to it,
 /// then rename it over. Readers see the old file or the new one, never half.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_with(path, |w| w.write_all(bytes))
 }
 

@@ -87,6 +87,22 @@ pub fn merge_jsonl(a: &str, b: &str) -> String {
     s
 }
 
+/// A whole jsonl in the order [`merge_jsonl`] gives its new lines: sorted
+/// by `(timestamp, line)`, a line without a timestamp keeping the previous
+/// line's. Repeated lines are kept (a repair removes nothing). For `claude-mesh repair`: transcripts merged
+/// before that order had old branches last, and `claude --resume` takes the
+/// file's last `last-prompt` line as the end of the conversation. Merging
+/// the result with any copy of the same lines gives the result back, so the
+/// other Macs settle on it.
+pub fn sort_jsonl(text: &str) -> String {
+    let all: Vec<&str> = lines(text).into_iter().filter(|l| !l.trim().is_empty()).collect();
+    let mut sorted = keyed(&all, i64::MIN);
+    sorted.sort_unstable();
+    let mut s = sorted.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n");
+    s.push('\n');
+    s
+}
+
 /// Each line with the key it's interleaved by: its timestamp, or the last
 /// one before it (starting from `since`, the shared prefix's last), then
 /// the line itself.
@@ -266,6 +282,30 @@ mod tests {
         let want = [base, whole, half, ten, brt].join("\n") + "\n";
         assert_eq!(merge_jsonl(&a, &b), want);
         assert_eq!(merge_jsonl(&b, &a), want);
+    }
+
+    #[test]
+    fn a_repaired_transcript_ends_at_its_latest_prompt_and_settles() {
+        // As the old merge left it: a branch from 09:00 pasted after 11:00,
+        // its `last-prompt` (no timestamp) last, so --resume opened there.
+        let lp = |p: &str| format!(r#"{{"type":"last-prompt","lastPrompt":"{p}"}}"#);
+        let scrambled = [
+            ts("08:00"), ts("10:00"), lp("ten"), ts("11:00"), lp("eleven"),
+            ts("09:00"), lp("nine"),
+        ]
+        .join("\n")
+            + "\n";
+        let repaired = sort_jsonl(&scrambled);
+        assert_eq!(
+            repaired,
+            [ts("08:00"), ts("09:00"), lp("nine"), ts("10:00"), lp("ten"), ts("11:00"), lp("eleven")]
+                .join("\n")
+                + "\n"
+        );
+        assert_eq!(sort_jsonl(&repaired), repaired);
+        // Another Mac still has the scrambled copy: both settle on the repair.
+        assert_eq!(merge_jsonl(&repaired, &scrambled), repaired);
+        assert_eq!(merge_jsonl(&scrambled, &repaired), repaired);
     }
 
     #[test]

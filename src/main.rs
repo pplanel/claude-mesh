@@ -85,6 +85,10 @@ usage:
   claude-mesh report [--since 1h] [--peer NAME] [--files]
                                         what recent rounds fetched, merged and couldn't do
                                         (from the journal; --since defaults to 24h)
+  claude-mesh repair [--dry-run] [--force] SESSION-ID
+                                        put a transcript merged out of order back in time
+                                        order, so `claude --resume` opens at its real end;
+                                        refuses an open session, keeps a backup
 
 environment:
   CLAUDE_MESH_LAYOUT      the layout table (default: /etc/claude-mesh/hosts.json)
@@ -105,6 +109,7 @@ fn main() {
         Some("status") => status(),
         Some("register") => register(),
         Some("report") => report(&args[1..]),
+        Some("repair") => repair(&args[1..]),
         _ => {
             eprint!("{USAGE}");
             2
@@ -305,6 +310,94 @@ fn release_free_memory() {
         // SAFETY: a plain libmalloc call; a null zone means all zones.
         unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     }
+}
+
+/// `repair [--dry-run] SESSION-ID`: sort a transcript into time order
+/// ([`merge::sort_jsonl`]). Merges before the fix put old branches last, so
+/// `claude --resume`, which takes the file's last `last-prompt` line as the
+/// end of the conversation, opened mid-way. Refuses a session open on this
+/// Mac; keeps the original next to the state file. The other Macs settle on
+/// the repaired file through the next rounds.
+fn repair(args: &[String]) -> i32 {
+    let dry = args.iter().any(|a| a == "--dry-run");
+    let force = args.iter().any(|a| a == "--force");
+    let Some(id) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprint!("{USAGE}");
+        return 2;
+    };
+    let node = match node() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("claude-mesh: {e}");
+            return 1;
+        }
+    };
+    let config = &node.host.config;
+    if sync::live_sessions(config).iter().any(|s| s == id) {
+        eprintln!("claude-mesh: {id} is open on this Mac; close it first");
+        return 1;
+    }
+    let found: Vec<PathBuf> = std::fs::read_dir(config.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join(format!("{id}.jsonl")))
+        .filter(|p| p.is_file())
+        .collect();
+    let [path] = found.as_slice() else {
+        eprintln!("claude-mesh: {} transcripts named {id}.jsonl under {}", found.len(), config.join("projects").display());
+        return 1;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("claude-mesh: can't read {}: {e}", path.display());
+            return 1;
+        }
+    };
+    let sorted = merge::sort_jsonl(&text);
+    let last_prompt = |t: &str| {
+        t.lines()
+            .rev()
+            .find(|l| l.contains(r#""type":"last-prompt""#))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .and_then(|v| v["lastPrompt"].as_str().map(|s| s.chars().take(60).collect::<String>()))
+            .unwrap_or_default()
+    };
+    let (before, after): (Vec<&str>, Vec<&str>) = (text.lines().collect(), sorted.lines().collect());
+    let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+    println!("{}", path.display());
+    println!("  lines:        {} → {} ({moved} in a different place)", before.len(), after.len());
+    println!("  resume ends:  {:?} → {:?}", last_prompt(&text), last_prompt(&sorted));
+    if sorted == text {
+        println!("  already in time order");
+        return 0;
+    }
+    // Claude itself writes a few lines milliseconds out of order; that's
+    // harmless. Only a file whose resume point is wrong needs rewriting.
+    if last_prompt(&sorted) == last_prompt(&text) && !force {
+        println!("  --resume already opens at the end; nothing to do (--force to sort anyway)");
+        return 0;
+    }
+    if dry {
+        println!("  (dry run: nothing written)");
+        return 0;
+    }
+    let backups = node.state_path.with_file_name("repair-backups");
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let backup = backups.join(format!("{id}-{secs}.jsonl"));
+    if let Err(e) = std::fs::create_dir_all(&backups).and_then(|()| std::fs::copy(path, &backup)) {
+        eprintln!("claude-mesh: can't keep a backup in {}: {e}", backups.display());
+        return 1;
+    }
+    if let Err(e) = sync::write_atomic(path, sorted.as_bytes()) {
+        eprintln!("claude-mesh: can't write {}: {e}", path.display());
+        return 1;
+    }
+    println!("  repaired; the original is in {}", backup.display());
+    0
 }
 
 /// `once`: one [`round`], then exit.
