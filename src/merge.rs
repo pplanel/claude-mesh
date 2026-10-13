@@ -20,11 +20,10 @@ use std::collections::HashSet;
 ///   kept going) → the longer one.
 /// * They diverged, and one side's new lines are all in the other's → that
 ///   other side (what an earlier merge produced, merged again).
-/// * Otherwise → the shared prefix, then both sides' new lines interleaved
-///   by time: at each step the next line of either side with the earlier
-///   `(timestamp, line)`, lines already present skipped. Each side keeps
-///   its own order, and a line without a timestamp counts as the time of
-///   the line before it, so it stays where it was written. Claude's
+/// * Otherwise → the shared prefix, then both sides' new lines as one set,
+///   sorted by `(timestamp, line)`, each line once. A line without a
+///   timestamp counts as the time of the line before it on its side (the
+///   earlier one if the sides differ), so it stays where it was written. Claude's
 ///   transcripts are trees linked by `parentUuid`, so interleaved branches
 ///   are still a valid file, and the newest line ends up last, where
 ///   `claude --resume` looks for the end of the conversation.
@@ -62,23 +61,27 @@ pub fn merge_jsonl(a: &str, b: &str) -> String {
         return b.to_string();
     }
 
+    // The new lines of both sides as one set, in time order: the result
+    // depends on which lines there are, not on the order either side wrote
+    // them in, so merging it again with either side gives it back, and the
+    // three Macs settle on the same file. (Taking the earlier of the two
+    // sides' next lines instead didn't: a side already out of order, like
+    // a file merged before this fix, gave a different order every round.)
     let since = prefix.iter().rev().find_map(|l| line_timestamp(l)).unwrap_or(i64::MIN);
-    let (ka, kb) = (keyed(ra, since), keyed(rb, since));
-    let mut seen: HashSet<&str> = prefix.iter().copied().collect();
-    let mut out: Vec<&str> = prefix.to_vec();
-    let (mut i, mut j) = (0, 0);
-    while i < ka.len() || j < kb.len() {
-        // Keys depend on the line alone, never on the side, so swapping
-        // `a` and `b` picks the same line at every step.
-        let from_a = match (ka.get(i), kb.get(j)) {
-            (Some(x), Some(y)) => x <= y,
-            (x, _) => x.is_some(),
-        };
-        let (_, line) = if from_a { i += 1; &ka[i - 1] } else { j += 1; &kb[j - 1] };
-        if seen.insert(line) {
-            out.push(line);
-        }
+    let mut keys: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for (key, line) in keyed(ra, since).into_iter().chain(keyed(rb, since)) {
+        let k = keys.entry(line).or_insert(key);
+        *k = (*k).min(key);
     }
+    let in_prefix: HashSet<&str> = prefix.iter().copied().collect();
+    let mut tail: Vec<(i64, &str)> = keys
+        .into_iter()
+        .filter(|(line, _)| !in_prefix.contains(line))
+        .map(|(line, key)| (key, line))
+        .collect();
+    tail.sort_unstable();
+    let mut out: Vec<&str> = prefix.to_vec();
+    out.extend(tail.into_iter().map(|(_, line)| line));
     let mut s = out.join("\n");
     s.push('\n');
     s
@@ -250,6 +253,26 @@ mod tests {
         let want = [base, whole, half, ten, brt].join("\n") + "\n";
         assert_eq!(merge_jsonl(&a, &b), want);
         assert_eq!(merge_jsonl(&b, &a), want);
+    }
+
+    #[test]
+    fn a_side_already_out_of_order_still_settles() {
+        // Like a transcript merged before the interleaving fix: an old block
+        // (09:30) after newer lines. Merging must reach a fixed point, or
+        // two Macs rewrite (and resend) the whole file every round.
+        let a = [ts("09:00"), ts("11:00"), ts("09:30"), ts("12:00")].join("\n") + "\n";
+        let b = [ts("09:00"), ts("10:00"), ts("11:30")].join("\n") + "\n";
+        let m = merge_jsonl(&a, &b);
+        assert_eq!(m, merge_jsonl(&b, &a));
+        for side in [&a, &b] {
+            assert_eq!(merge_jsonl(&m, side), m);
+            assert_eq!(merge_jsonl(side, &m), m);
+        }
+        // A third Mac with its own new line converges on the same file.
+        let c = [ts("09:00"), ts("10:00"), ts("11:45")].join("\n") + "\n";
+        let mc = merge_jsonl(&m, &c);
+        assert_eq!(merge_jsonl(&merge_jsonl(&a, &c), &b), mc);
+        assert_eq!(merge_jsonl(&mc, &m), mc);
     }
 
     #[test]
