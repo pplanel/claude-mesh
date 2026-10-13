@@ -286,7 +286,24 @@ fn serve(args: &[String]) -> i32 {
     }
     loop {
         round(&node);
+        release_free_memory();
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+/// Hand memory freed during the round back to the system. macOS's allocator
+/// keeps large freed blocks for reuse, and they count in the process's
+/// footprint (Activity Monitor) until it's asked to let them go.
+fn release_free_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            /// libmalloc: release free pages of `zone` (null: every zone)
+            /// until `goal` bytes are released (0: as many as possible).
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a plain libmalloc call; a null zone means all zones.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     }
 }
 

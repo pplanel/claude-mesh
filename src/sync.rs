@@ -499,13 +499,12 @@ fn resolve(
     their_mtime: u64,
     unchanged_here: bool,
 ) -> (Vec<u8>, bool) {
-    let as_text = |b: &[u8]| std::str::from_utf8(b).ok().map(str::to_string);
-    match (strategy_for(rel), as_text(mine), as_text(theirs)) {
-        (Strategy::Jsonl, Some(a), Some(b)) => (merge_jsonl(&a, &b).into_bytes(), false),
+    match (strategy_for(rel), std::str::from_utf8(mine).ok(), std::str::from_utf8(theirs).ok()) {
+        (Strategy::Jsonl, Some(a), Some(b)) => (merge_jsonl(a, b).into_bytes(), false),
         (Strategy::LineUnion, Some(a), Some(b)) => {
             let merged = match base.and_then(|o| std::str::from_utf8(o).ok()) {
-                Some(o) => merge_lines_3way(o, &a, &b),
-                None => merge_line_union(&a, &b),
+                Some(o) => merge_lines_3way(o, a, b),
+                None => merge_line_union(a, b),
             };
             (merged.into_bytes(), false)
         }
@@ -530,18 +529,22 @@ fn write_local(
     old_canonical: Option<&[u8]>,
     result: &[u8],
 ) -> std::io::Result<()> {
-    let new_local = canon.content_from_canonical(local_rel, result);
-    if let Some(old) = old_canonical {
-        let old_local = canon.content_from_canonical(local_rel, old);
-        if local_rel.ends_with(".jsonl") && new_local.starts_with(&old_local) {
-            let current = std::fs::read(path)?;
-            if current == old_local {
-                let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
-                return f.write_all(&new_local[old_local.len()..]);
-            }
-        }
+    // Rewriting is line by line, so when `result` continues `old` past a
+    // line end, the new lines alone can be rewritten and appended: no copy
+    // of the whole file. Only if the file on disk still reads as `old`.
+    if let Some(old) = old_canonical
+        && local_rel.ends_with(".jsonl")
+        && old.ends_with(b"\n")
+        && result.starts_with(old)
+        && std::fs::File::open(path)
+            .and_then(|f| canon.hash_canonical(local_rel, f))
+            .is_ok_and(|h| h == blake3::hash(old))
+    {
+        let tail = canon.content_from_canonical(local_rel, &result[old.len()..]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+        return f.write_all(&tail);
     }
-    write_atomic(path, &new_local)
+    write_atomic(path, &canon.content_from_canonical(local_rel, result))
 }
 
 /// Replace `path` with `bytes` in one step: write a temp file next to it,

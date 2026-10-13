@@ -197,6 +197,62 @@ impl Canon {
         Ok(hasher.finalize())
     }
 
+    /// Call `f` with the canonical contents of the first `limit` bytes of
+    /// `reader` (from its start), in order: a line at a time for text, a
+    /// block at a time for anything else. The same bytes as
+    /// [`Canon::content_to_canonical`], without holding the file in memory.
+    /// Text is checked for UTF-8 first (a file that isn't passes through
+    /// unchanged), then read again to rewrite it; `limit` makes both reads,
+    /// and two calls, see the same contents while the file is appended to.
+    pub fn for_each_canonical<R: Read + Seek>(
+        &self,
+        rel: &str,
+        mut reader: R,
+        limit: u64,
+        mut f: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut line = Vec::new();
+        if Self::is_text(rel) {
+            let mut utf8 = true;
+            let mut lines = BufReader::new((&mut reader).take(limit));
+            while {
+                line.clear();
+                lines.read_until(b'\n', &mut line)? > 0
+            } {
+                if std::str::from_utf8(&line).is_err() {
+                    utf8 = false;
+                    break;
+                }
+            }
+            drop(lines);
+            reader.seek(SeekFrom::Start(0))?;
+            if utf8 {
+                let mut lines = BufReader::new((&mut reader).take(limit));
+                loop {
+                    line.clear();
+                    if lines.read_until(b'\n', &mut line)? == 0 {
+                        return Ok(());
+                    }
+                    // Valid on the first read; if the file changed since,
+                    // pass the line as is rather than fail.
+                    match std::str::from_utf8(&line) {
+                        Ok(text) => f(self.text_to_canonical(text).as_bytes())?,
+                        Err(_) => f(&line)?,
+                    }
+                }
+            }
+        }
+        let mut block = reader.take(limit);
+        line.resize(64 << 10, 0);
+        loop {
+            let n = block.read(&mut line)?;
+            if n == 0 {
+                return Ok(());
+            }
+            f(&line[..n])?;
+        }
+    }
+
     /// The path rewriting of [`Canon::content_to_canonical`], on text: this
     /// Mac's `projects/<src key>`, config folder and source folder replaced
     /// by their tokens, longest first (on arrakis the config path contains

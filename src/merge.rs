@@ -32,6 +32,14 @@ pub fn merge_jsonl(a: &str, b: &str) -> String {
     if a == b {
         return a.to_string();
     }
+    // The usual case, without splitting either into lines: one side is the
+    // other plus whole lines.
+    if b.starts_with(a) && a.ends_with('\n') {
+        return b.to_string();
+    }
+    if a.starts_with(b) && b.ends_with('\n') {
+        return a.to_string();
+    }
     let la: Vec<&str> = lines(a);
     let lb: Vec<&str> = lines(b);
     let common = la.iter().zip(&lb).take_while(|(x, y)| x == y).count();

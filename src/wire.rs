@@ -30,7 +30,7 @@
 //! ```
 
 use crate::scan::Scanner;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -68,10 +68,73 @@ pub fn serve_stream(
     scanner: &Scanner,
 ) -> std::io::Result<()> {
     for line in input.lines() {
-        let (ok, body) = answer(line?.trim(), host, scanner);
-        writeln!(out, "{} {}", if ok { "ok" } else { "err" }, body.len())?;
-        out.write_all(&body)?;
+        let line = line?;
+        if let Some((rel, from)) = file_request(line.trim()) {
+            stream_file(&mut out, scanner, &rel, from)?;
+        } else {
+            let (ok, body) = answer(line.trim(), host, scanner);
+            writeln!(out, "{} {}", if ok { "ok" } else { "err" }, body.len())?;
+            out.write_all(&body)?;
+        }
         out.flush()?;
+    }
+    Ok(())
+}
+
+/// `file <hex>` and `tail <hex> <offset>` as (canonical path, offset).
+fn file_request(request: &str) -> Option<(String, u64)> {
+    match request.split_once(' ')? {
+        ("file", hex) => Some((hex_decode(hex)?, 0)),
+        ("tail", args) => {
+            let (hex, offset) = args.split_once(' ')?;
+            Some((hex_decode(hex)?, offset.parse().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Answer `file`/`tail`: the canonical contents of `canon_rel` from byte
+/// `from`, read and written a line at a time, never whole. The length goes
+/// first, so the file is read twice: once to measure, once to send. Both
+/// reads stop at the size it had when opened, so a log being appended to
+/// sends what it had. A file that shrinks between them would leave the
+/// response short; that closes the stream (the peer retries next round)
+/// rather than letting it fall out of step.
+fn stream_file(
+    out: &mut impl Write,
+    scanner: &Scanner,
+    canon_rel: &str,
+    from: u64,
+) -> std::io::Result<()> {
+    let not_found = |out: &mut dyn Write| out.write_all(b"err 9\nnot found");
+    let Some((mut file, rel, size)) = scanner.open_canonical(canon_rel) else {
+        return not_found(out);
+    };
+    let canon = scanner.canon();
+    let mut len = 0u64;
+    if canon
+        .for_each_canonical(&rel, &mut file, size, |b| {
+            len += b.len() as u64;
+            Ok(())
+        })
+        .is_err()
+        || from > len
+    {
+        return not_found(out);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(out, "ok {}", len - from)?;
+    let (mut skip, mut left) = (from, len - from);
+    canon.for_each_canonical(&rel, &mut file, size, |b| {
+        let cut = skip.min(b.len() as u64) as usize;
+        skip -= cut as u64;
+        let b = &b[cut..];
+        let n = left.min(b.len() as u64) as usize;
+        left -= n as u64;
+        out.write_all(&b[..n])
+    })?;
+    if left > 0 {
+        return Err(std::io::Error::other(format!("{canon_rel} shrank while being sent")));
     }
     Ok(())
 }
@@ -88,21 +151,6 @@ fn answer(request: &str, host: &str, scanner: &Scanner) -> (bool, Vec<u8>) {
             Ok(body) => (true, body),
             Err(e) => (false, e.to_string().into_bytes()),
         },
-        ("file", hex) => match hex_decode(hex).and_then(|rel| scanner.read_canonical(&rel)) {
-            Some(bytes) => (true, bytes),
-            None => (false, b"not found".to_vec()),
-        },
-        ("tail", args) => {
-            let tail = args.split_once(' ').and_then(|(hex, offset)| {
-                let bytes = scanner.read_canonical(&hex_decode(hex)?)?;
-                let offset: usize = offset.parse().ok()?;
-                bytes.get(offset..).map(<[u8]>::to_vec)
-            });
-            match tail {
-                Some(bytes) => (true, bytes),
-                None => (false, b"not found".to_vec()),
-            }
-        }
         _ => (false, b"unknown request".to_vec()),
     }
 }
@@ -282,6 +330,44 @@ pub fn hex_decode(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_are_served_a_line_at_a_time() {
+        // A 16 MiB transcript (arrakis's layout, so every line is rewritten).
+        let dir = tempfile::tempdir().unwrap();
+        let canon = crate::canon::Canon::new(&crate::layout::find("arrakis").unwrap());
+        let scanner = Scanner::new(dir.path().to_path_buf(), canon);
+        let rel = "projects/-Users-pplanel/big.jsonl";
+        let line = r#"{"cwd":"/Users/pplanel/src/pplanel/x","m":"/Users/pplanel/src/pplanel/.claude/projects/-Users-pplanel-src-pplanel-x/m.md"}"#;
+        let mut contents = String::new();
+        while contents.len() < 16 << 20 {
+            contents.push_str(line);
+            contents.push('\n');
+        }
+        std::fs::create_dir_all(dir.path().join("projects/-Users-pplanel")).unwrap();
+        std::fs::write(dir.path().join(rel), &contents).unwrap();
+        drop(contents);
+
+        let whole = scanner.read_canonical(rel).unwrap();
+        let offset = whole.len() / 2 + 7;
+        for (request, body) in [
+            (format!("file {}\n", hex_encode(rel)), &whole[..]),
+            (format!("tail {} {offset}\n", hex_encode(rel)), &whole[offset..]),
+        ] {
+            let mut want = blake3::Hasher::new();
+            want.update(format!("ok {}\n", body.len()).as_bytes());
+            want.update(body);
+            let mut got = blake3::Hasher::new();
+            let peak = crate::heap::peak_during(|| {
+                serve_stream(request.as_bytes(), &mut got, "arrakis", &scanner).unwrap()
+            });
+            assert_eq!(got.finalize(), want.finalize(), "{request}");
+            assert!(peak < 256 << 10, "{request}: peak {peak} B");
+        }
+        let mut out = Vec::new();
+        serve_stream(&b"file 6e6f\ntail 6e6f 0\n"[..], &mut out, "arrakis", &scanner).unwrap();
+        assert_eq!(out, b"err 9\nnot founderr 9\nnot found");
+    }
 
     #[test]
     fn hex_round_trip() {

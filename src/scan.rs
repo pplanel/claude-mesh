@@ -132,6 +132,16 @@ impl Scanner {
         Some(self.canon.content_to_canonical(&rel, &bytes))
     }
 
+    /// A canonical path's file opened for reading, with its local relative
+    /// path (what [`Canon::for_each_canonical`] needs) and its size now, if
+    /// it is a synced file.
+    pub fn open_canonical(&self, canon_rel: &str) -> Option<(std::fs::File, String, u64)> {
+        let rel = self.canon.rel_from_canonical(canon_rel);
+        let file = std::fs::File::open(self.local_path(&rel)?).ok()?;
+        let size = file.metadata().ok()?.len();
+        Some((file, rel, size))
+    }
+
     /// The absolute path of a local relative path, refusing anything that
     /// escapes the config folder or isn't under an included entry.
     pub fn local_path(&self, rel: &str) -> Option<PathBuf> {
