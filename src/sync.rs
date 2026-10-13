@@ -200,7 +200,10 @@ pub fn sync_peer(
         }
         let ours = local.get(rel);
         if ours.is_some_and(|o| o.hash == theirs.hash) {
-            settle_peer_copy(peer_copies, rel, scanner.read_canonical(rel).as_deref());
+            let same = (strategy_for(rel) == Strategy::LineUnion)
+                .then(|| scanner.read_canonical(rel))
+                .flatten();
+            settle_peer_copy(peer_copies, rel, same.as_deref());
             seen.insert(rel.clone(), theirs.hash.clone());
             state.local.insert(rel.clone(), theirs.hash.clone());
             continue;
@@ -246,10 +249,7 @@ pub fn sync_peer(
         // The same bytes on disk once written in our layout: the same file,
         // whatever the canonical forms say (rewriting paths isn't always
         // reversible). Record it; nothing to merge, nothing in conflict.
-        if ours.is_some()
-            && std::fs::read(&path).ok()
-                == Some(canon.content_from_canonical(&local_rel, &remote_bytes))
-        {
+        if ours.is_some() && same_on_disk(canon, &local_rel, &path, &remote_bytes) {
             state
                 .seen
                 .entry(peer.to_string())
@@ -262,14 +262,14 @@ pub fn sync_peer(
         }
         let local_bytes = ours.and_then(|_| scanner.read_canonical(rel));
 
-        let (result, conflict) = match &local_bytes {
-            None => (remote_bytes.clone(), false),
+        let (merged, conflict) = match &local_bytes {
+            None => (None, false),
             Some(mine) => {
                 let unchanged_here = ours.is_some_and(|o| state.local.get(rel) == Some(&o.hash));
                 let base = (strategy_for(rel) == Strategy::LineUnion)
                     .then(|| std::fs::read(peer_copy_path(peer_copies, rel)).ok())
                     .flatten();
-                resolve(
+                let (r, c) = resolve(
                     rel,
                     base.as_deref(),
                     mine,
@@ -277,9 +277,12 @@ pub fn sync_peer(
                     &remote_bytes,
                     theirs.mtime,
                     unchanged_here,
-                )
+                );
+                (Some(r), c)
             }
         };
+        // A new file is the peer's bytes as they are: no copy.
+        let result: &[u8] = merged.as_deref().unwrap_or(&remote_bytes);
 
         // A file that can't be written here (a name too long for this
         // layout, a permission) is logged and skipped, not the whole round.
@@ -299,13 +302,13 @@ pub fn sync_peer(
                     conflict_copy = Some(conflict_rel);
                 }
             }
-            if local_bytes.as_deref() == Some(result.as_slice()) {
+            if local_bytes.as_deref() == Some(result) {
                 return Ok(Some(false));
             }
             if is_active(&path, now_ms()) {
                 return Ok(None);
             }
-            write_local(canon, &local_rel, &path, local_bytes.as_deref(), &result)?;
+            write_local(canon, &local_rel, &path, local_bytes.as_deref(), result)?;
             // Their content keeps their time. Written with ours, a copy
             // relayed through a third Mac would look newer than an edit
             // made after it, and win the next last-writer-wins.
@@ -352,7 +355,9 @@ pub fn sync_peer(
         // becomes a token there), so re-reading what we wrote can give other
         // canonical bytes than `result`. Recording `result`'s hash would make
         // the next round think we changed the file, and conflict forever.
-        let ours_now = scanner.read_canonical(rel).unwrap_or(result);
+        let ours_now = std::fs::File::open(&path)
+            .and_then(|f| canon.hash_canonical(&local_rel, f))
+            .unwrap_or_else(|_| blake3::hash(result));
         // When our copy, read back, isn't the peer's (two branches of a
         // session merged, or paths that read back differently in our layout),
         // ours can't be the base for the peer's next tail. Keep the peer's
@@ -360,7 +365,7 @@ pub fn sync_peer(
         if strategy_for(rel) == Strategy::LineUnion {
             keep_peer_copy(peer_copies, rel, &remote_bytes);
         } else if rel.ends_with(".jsonl") {
-            if ours_now == remote_bytes {
+            if ours_now.to_hex().as_str() == theirs.hash {
                 forget_peer_copy(peer_copies, rel);
             } else {
                 keep_peer_copy(peer_copies, rel, &remote_bytes);
@@ -368,7 +373,7 @@ pub fn sync_peer(
         }
         state
             .local
-            .insert(rel.clone(), blake3::hash(&ours_now).to_hex().to_string());
+            .insert(rel.clone(), ours_now.to_hex().to_string());
     }
     Ok(())
 }
@@ -544,12 +549,35 @@ fn write_local(
         let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
         return f.write_all(&tail);
     }
-    write_atomic(path, &canon.content_from_canonical(local_rel, result))
+    write_atomic_with(path, |w| canon.for_each_from_canonical(local_rel, result, |b| w.write_all(b)))
+}
+
+/// Whether `path` already holds `remote` (canonical) in this Mac's form,
+/// compared by hash, rewriting a line at a time: no copy of either file.
+fn same_on_disk(canon: &Canon, local_rel: &str, path: &Path, remote: &[u8]) -> bool {
+    let mut want = blake3::Hasher::new();
+    canon
+        .for_each_from_canonical(local_rel, remote, |b| {
+            want.update(b);
+            Ok(())
+        })
+        .ok();
+    let mut have = blake3::Hasher::new();
+    std::fs::File::open(path).and_then(|f| have.update_reader(f).map(|_| ())).is_ok()
+        && have.finalize() == want.finalize()
 }
 
 /// Replace `path` with `bytes` in one step: write a temp file next to it,
 /// then rename it over. Readers see the old file or the new one, never half.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, |w| w.write_all(bytes))
+}
+
+/// [`write_atomic`], with the contents written by `fill` (a piece at a time).
+fn write_atomic_with(
+    path: &Path,
+    fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     // Short whatever the target's name: a long name plus a prefix could pass
@@ -560,7 +588,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .unwrap_or_default();
     let tag = &blake3::hash(name).to_hex()[..16];
     let tmp: PathBuf = dir.join(format!(".claude-mesh-{}-{tag}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    fill(&mut w)?;
+    w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     std::fs::rename(&tmp, path)
 }
 

@@ -273,20 +273,42 @@ impl Canon {
     /// paths. Not always the exact inverse of [`Canon::content_to_canonical`];
     /// see the module docs.
     pub fn content_from_canonical(&self, rel: &str, bytes: &[u8]) -> Vec<u8> {
-        if !Self::is_text(rel) {
-            return bytes.to_vec();
-        }
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return bytes.to_vec();
+        let mut out = Vec::with_capacity(bytes.len());
+        self.for_each_from_canonical(rel, bytes, |b| {
+            out.extend_from_slice(b);
+            Ok(())
+        })
+        .expect("writing to a Vec doesn't fail");
+        out
+    }
+
+    /// Call `f` with [`Canon::content_from_canonical`]`(rel, bytes)` a line
+    /// at a time (or whole, for binary files and text that isn't UTF-8), so
+    /// it can be hashed or written without a second copy of the file.
+    pub fn for_each_from_canonical(
+        &self,
+        rel: &str,
+        bytes: &[u8],
+        mut f: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) if Self::is_text(rel) => text,
+            _ => return f(bytes),
         };
-        let text = text
-            .replace(
-                &format!("projects/{SRCKEY}"),
-                &format!("projects/{}", self.src_key),
-            )
-            .replace(CFG, &self.config)
-            .replace(SRC, &self.src);
-        text.into_bytes()
+        let project = format!("projects/{SRCKEY}");
+        let local_project = format!("projects/{}", self.src_key);
+        for line in text.split_inclusive('\n') {
+            if !line.contains(&project) && !line.contains(CFG) && !line.contains(SRC) {
+                f(line.as_bytes())?;
+            } else {
+                let line = line
+                    .replace(&project, &local_project)
+                    .replace(CFG, &self.config)
+                    .replace(SRC, &self.src);
+                f(line.as_bytes())?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -183,13 +183,26 @@ fn lines(s: &str) -> Vec<&str> {
 /// compare by the instant, not by their text) or a number (`history.jsonl`,
 /// already in ms). `None` if the line isn't JSON or has no usable one.
 fn line_timestamp(line: &str) -> Option<i64> {
-    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    match v.get("timestamp")? {
-        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+    // Only the timestamp is deserialized; the rest of the line (a tool result
+    // can be megabytes) is skipped without being built.
+    #[derive(serde::Deserialize)]
+    struct Line<'a> {
+        #[serde(borrow)]
+        timestamp: Option<Stamp<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Stamp<'a> {
+        Text(&'a str),
+        Number(serde_json::Number),
+        Other(serde::de::IgnoredAny),
+    }
+    match serde_json::from_str::<Line>(line).ok()?.timestamp? {
+        Stamp::Text(s) => chrono::DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|t| t.timestamp_millis()),
-        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        _ => None,
+        Stamp::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Stamp::Other(_) => None,
     }
 }
 
@@ -253,6 +266,37 @@ mod tests {
         let want = [base, whole, half, ten, brt].join("\n") + "\n";
         assert_eq!(merge_jsonl(&a, &b), want);
         assert_eq!(merge_jsonl(&b, &a), want);
+    }
+
+    #[test]
+    fn a_huge_line_timestamp_is_read_without_building_the_line() {
+        let big = "x".repeat(4 << 20);
+        let line = format!(r#"{{"timestamp":"2026-10-08T10:00:00.000Z","toolUseResult":{{"stdout":"{big}","n":[1,2,3]}}}}"#);
+        let mut t = None;
+        let peak = crate::heap::peak_during(|| t = line_timestamp(&line));
+        assert_eq!(t, Some(1_791_453_600_000));
+        assert!(peak < 64 << 10, "peak {peak} B");
+    }
+
+    #[test]
+    fn a_big_diverged_merge_holds_about_the_result() {
+        // Two 8 MiB branches after a shared line: the result is ~16 MiB.
+        let line = |t: usize, side: &str| {
+            format!(r#"{{"timestamp":"2026-10-08T{:02}:{:02}:{:02}.000Z","n":{t},"side":"{side}","pad":"{}"}}"#, 10 + t / 3600, t / 60 % 60, t % 60, "p".repeat(200))
+        };
+        let (mut a, mut b) = (ts("09:00") + "\n", ts("09:00") + "\n");
+        let mut t = 0;
+        while a.len() < 8 << 20 {
+            a.push_str(&line(t, "a"));
+            a.push('\n');
+            b.push_str(&line(t, "b"));
+            b.push('\n');
+            t += 1;
+        }
+        let mut len = 0;
+        let peak = crate::heap::peak_during(|| len = merge_jsonl(&a, &b).len());
+        assert!(len > a.len() + b.len() - 64);
+        assert!(peak < 3 * len, "peak {peak} B for a {len} B result");
     }
 
     #[test]
