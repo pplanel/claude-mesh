@@ -59,7 +59,9 @@ mod heap;
 mod journal;
 mod layout;
 mod merge;
+mod origin;
 mod scan;
+mod session;
 mod sync;
 mod wire;
 
@@ -85,6 +87,9 @@ usage:
   claude-mesh report [--since 1h] [--peer NAME] [--files]
                                         what recent rounds fetched, merged and couldn't do
                                         (from the journal; --since defaults to 24h)
+  claude-mesh session SESSION-ID|PATH.jsonl
+                                        a session's outline: stretches by Mac and day,
+                                        prompts, the first of each, compactions
   claude-mesh repair [--dry-run] [--force] SESSION-ID|PATH.jsonl
                                         put a transcript merged out of order back in time
                                         order, so `claude --resume` opens at its real end;
@@ -110,6 +115,7 @@ fn main() {
         Some("register") => register(),
         Some("report") => report(&args[1..]),
         Some("repair") => repair(&args[1..]),
+        Some("session") => session(&args[1..]),
         _ => {
             eprint!("{USAGE}");
             2
@@ -195,6 +201,20 @@ fn node() -> Result<Node, String> {
 /// changed, save the state. An unreachable peer is logged and skipped.
 fn round(node: &Node) {
     let mut state = State::load(&node.state_path);
+    // Next to the state file, like state.peers/: never inside the synced folder.
+    let state_dir = &node.state_path.with_extension("origins");
+    // Lines Claude Code wrote here since the last round are this Mac's;
+    // claim them before pulling anything (see `origin`). With no peer there's
+    // nobody to tell (and the tests' servers, which have none, would race the
+    // `once` runs over the same bookkeeping); lines written meanwhile are
+    // still claimed once a peer appears.
+    if !node.peers.is_empty() {
+        match origin::claim(&node.host.config, state_dir, &node.host.name) {
+            Ok(0) => {}
+            Ok(n) => log!("origins: claimed {n} new lines"),
+            Err(e) => log!("origins: can't claim ({e})"),
+        }
+    }
     let journal = journal::path_for(&node.state_path);
     for peer in &node.peers {
         let started = now_ms();
@@ -233,6 +253,24 @@ fn round(node: &Node) {
                 journal::bytes(report.fetched),
                 report.tails
             );
+        }
+        // Transcripts written from this peer: their lines aren't ours.
+        let written: Vec<PathBuf> = report
+            .files
+            .iter()
+            .filter(|f| {
+                matches!(f.action, sync::Action::Pulled | sync::Action::Merged | sync::Action::Conflict)
+                    && f.path.starts_with("projects/")
+                    && f.path.ends_with(".jsonl")
+                    && f.path.matches('/').count() == 2
+            })
+            .filter_map(|f| {
+                let rel = node.scanner.canon().rel_from_canonical(&f.path);
+                node.scanner.local_path(&rel)
+            })
+            .collect();
+        if let Err(e) = origin::mark_seen(state_dir, &written) {
+            log!("origins: can't mark pulled lines ({e})");
         }
         if let Err(e) = state.save(&node.state_path) {
             log!("can't save state to {}: {e}", node.state_path.display());
@@ -333,33 +371,18 @@ fn repair(args: &[String]) -> i32 {
         }
     };
     let config = &node.host.config;
-    // A path picks one copy when the session id is under several projects
-    // (a session moved between projects keeps its old copy there).
-    let given = PathBuf::from(id);
-    let id = &given
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|_| given.extension().is_some_and(|e| e == "jsonl"))
-        .unwrap_or_else(|| id.to_string());
+    let (id, path) = match find_transcript(config, id) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("claude-mesh: {e}");
+            return 1;
+        }
+    };
+    let (id, path) = (&id, &path);
     if sync::live_sessions(config).iter().any(|s| s == id) {
         eprintln!("claude-mesh: {id} is open on this Mac; close it first");
         return 1;
     }
-    let found: Vec<PathBuf> = if given.is_file() {
-        vec![given.clone()]
-    } else {
-        std::fs::read_dir(config.join("projects"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|d| d.path().join(format!("{id}.jsonl")))
-        .filter(|p| p.is_file())
-        .collect()
-    };
-    let [path] = found.as_slice() else {
-        eprintln!("claude-mesh: {} transcripts named {id}.jsonl under {}", found.len(), config.join("projects").display());
-        return 1;
-    };
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -410,6 +433,57 @@ fn repair(args: &[String]) -> i32 {
     }
     println!("  repaired; the original is in {}", backup.display());
     0
+}
+
+/// A transcript by session id (under any project) or by path, as (session
+/// id, path). A path picks one copy when the id is under several projects
+/// (a session moved between projects keeps its old copy there).
+fn find_transcript(config: &std::path::Path, arg: &str) -> Result<(String, PathBuf), String> {
+    let given = PathBuf::from(arg);
+    if given.is_file() && given.extension().is_some_and(|e| e == "jsonl") {
+        let id = given.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        return Ok((id, given));
+    }
+    let found: Vec<PathBuf> = std::fs::read_dir(config.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join(format!("{arg}.jsonl")))
+        .filter(|p| p.is_file())
+        .collect();
+    match found.as_slice() {
+        [one] => Ok((arg.to_string(), one.clone())),
+        _ => Err(format!(
+            "{} transcripts named {arg}.jsonl under {}; give the path",
+            found.len(),
+            config.join("projects").display()
+        )),
+    }
+}
+
+/// `session SESSION-ID|PATH.jsonl`: print the session's outline
+/// ([`session::print`]).
+fn session(args: &[String]) -> i32 {
+    let Some(arg) = args.first() else {
+        eprint!("{USAGE}");
+        return 2;
+    };
+    let node = match node() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("claude-mesh: {e}");
+            return 1;
+        }
+    };
+    let result = find_transcript(&node.host.config, arg)
+        .and_then(|(id, path)| session::print(&node.host.config, &id, &path).map_err(|e| e.to_string()));
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("claude-mesh: {e}");
+            1
+        }
+    }
 }
 
 /// `once`: one [`round`], then exit.

@@ -182,7 +182,10 @@ pub enum Strategy {
 pub fn strategy_for(rel: &str) -> Strategy {
     if rel.ends_with(".jsonl") {
         Strategy::Jsonl
-    } else if rel.ends_with("/memory/MEMORY.md") || rel == "MEMORY.md" {
+    } else if rel.ends_with("/memory/MEMORY.md")
+        || rel == "MEMORY.md"
+        || rel.starts_with("mesh/origins/")
+    {
         Strategy::LineUnion
     } else {
         Strategy::LastWriterWins

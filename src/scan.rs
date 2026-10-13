@@ -28,6 +28,7 @@ pub const INCLUDE: &[&str] = &[
     "agents",        // user-defined subagents
     "commands",      // user-defined slash commands
     "history.jsonl", // prompt history (up-arrow)
+    "mesh",          // claude-mesh's own synced data: which Mac wrote each line
 ];
 
 /// Files above this size are skipped (logged once per scan).

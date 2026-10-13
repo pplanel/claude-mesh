@@ -2,7 +2,7 @@
 //! its own Claude config folder, talking over localhost (`tcp:` routes)
 //! instead of airshell.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -542,4 +542,31 @@ fn the_latest_edit_wins_even_when_the_older_one_is_relayed() {
     assert_eq!(read(&mesh.dirs[0], rel), "from caladan\n");
     pull(2, 0);
     assert_eq!(read(&mesh.dirs[2], rel), "from imperium\n");
+}
+
+#[test]
+fn every_mac_learns_which_mac_wrote_each_line() {
+    let mesh = start();
+    let rel = "projects/-Users-pplanel/s1.jsonl";
+    let line = |u: &str, t: &str| format!(r#"{{"uuid":"{u}","timestamp":"2026-10-13T00:{t}:00.000Z"}}"#);
+    // Written before any Mac's first claiming round: history, nobody's.
+    write(&mesh.dirs[0], rel, &(line("a0", "00") + "\n"));
+    converge(&mesh);
+    // A turn on arrakis, then one on imperium, each synced around.
+    let append = |i: usize, l: String| {
+        let mut f = std::fs::OpenOptions::new().append(true).open(mesh.dirs[i].join(rel)).unwrap();
+        writeln!(f, "{l}").unwrap();
+    };
+    append(0, line("a1", "01"));
+    converge(&mesh);
+    append(2, line("i1", "02"));
+    converge(&mesh);
+    for d in &mesh.dirs {
+        let reg = read(d, "mesh/origins/s1.origin");
+        assert!(reg.contains("a1 arrakis"), "{} has {reg:?}", d.display());
+        assert!(reg.contains("i1 imperium"), "{} has {reg:?}", d.display());
+        assert!(!reg.contains("a0"), "history has no owner: {reg:?}");
+        assert!(!reg.contains("caladan"), "caladan wrote nothing: {reg:?}");
+        assert_eq!(reg.lines().count(), 2, "{reg:?}");
+    }
 }
