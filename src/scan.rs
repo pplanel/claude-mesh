@@ -107,12 +107,14 @@ impl Scanner {
                 out.insert(canon_rel, e.clone());
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(file) = std::fs::File::open(&path) else {
                 continue;
             };
-            let canon_bytes = self.canon.content_to_canonical(&rel, &bytes);
+            let Ok(hash) = self.canon.hash_canonical(&rel, file) else {
+                continue;
+            };
             let entry = Entry {
-                hash: blake3::hash(&canon_bytes).to_hex().to_string(),
+                hash: hash.to_hex().to_string(),
                 size,
                 mtime,
             };

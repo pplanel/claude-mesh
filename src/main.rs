@@ -54,6 +54,8 @@ macro_rules! log {
 
 mod airshell;
 mod canon;
+#[cfg(test)]
+mod heap;
 mod journal;
 mod layout;
 mod merge;

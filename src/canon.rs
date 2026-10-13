@@ -40,6 +40,9 @@
 //! copy as the base for tails. The quoted path itself may end up rewritten;
 //! that's the documented limit of textual rewriting.
 
+use std::borrow::Cow;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
 use crate::layout::{Host, project_key};
 
 /// Stands for this Mac's Claude config folder in canonical contents.
@@ -157,15 +160,57 @@ impl Canon {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return bytes.to_vec();
         };
-        // Longest first: on arrakis the config path contains the source path.
-        let text = text
-            .replace(
-                &format!("projects/{}", self.src_key),
-                &format!("projects/{SRCKEY}"),
-            )
-            .replace(&self.config, CFG)
-            .replace(&self.src, SRC);
-        text.into_bytes()
+        self.text_to_canonical(text).into_owned().into_bytes()
+    }
+
+    /// The BLAKE3 hash of [`Canon::content_to_canonical`]`(rel, contents)`,
+    /// read from `reader` without holding the whole file in memory: text
+    /// is rewritten line by line, anything else hashed in blocks. Equal to
+    /// hashing the whole canonical contents because no path or token
+    /// contains a newline, and a newline byte never sits inside a UTF-8
+    /// sequence. A text file that turns out not to be UTF-8 is hashed again
+    /// from the start, unchanged, as `content_to_canonical` passes it.
+    pub fn hash_canonical<R: Read + Seek>(
+        &self,
+        rel: &str,
+        mut reader: R,
+    ) -> std::io::Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        if Self::is_text(rel) {
+            let mut lines = BufReader::new(&mut reader);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                if lines.read_until(b'\n', &mut line)? == 0 {
+                    return Ok(hasher.finalize());
+                }
+                let Ok(text) = std::str::from_utf8(&line) else {
+                    break;
+                };
+                hasher.update(self.text_to_canonical(text).as_bytes());
+            }
+            drop(lines);
+            hasher.reset();
+            reader.seek(SeekFrom::Start(0))?;
+        }
+        hasher.update_reader(reader)?;
+        Ok(hasher.finalize())
+    }
+
+    /// The path rewriting of [`Canon::content_to_canonical`], on text: this
+    /// Mac's `projects/<src key>`, config folder and source folder replaced
+    /// by their tokens, longest first (on arrakis the config path contains
+    /// the source path). Borrowed when there's nothing to replace.
+    fn text_to_canonical<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let project = format!("projects/{}", self.src_key);
+        if !text.contains(&project) && !text.contains(&self.config) && !text.contains(&self.src) {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(
+            text.replace(&project, &format!("projects/{SRCKEY}"))
+                .replace(&self.config, CFG)
+                .replace(&self.src, SRC),
+        )
     }
 
     /// Canonical contents in this Mac's form: the tokens replaced by its own
@@ -251,6 +296,64 @@ mod tests {
             String::from_utf8(on_imperium).unwrap(),
             r#"{"cwd":"/Users/pplanel/src/shift-compute","m":"/Users/pplanel/.claude/projects/-Users-pplanel-src-shift-compute/memory/x.md"}"#
         );
+    }
+
+    #[test]
+    fn streaming_hash_matches_whole_file_hash() {
+        let cases: &[(&str, &[u8])] = &[
+            ("empty.jsonl", b""),
+            (
+                "a.jsonl",
+                b"{\"cwd\":\"/Users/pplanel/src/pplanel/x\"}\n{\"m\":\"/Users/pplanel/src/pplanel/.claude/projects/-Users-pplanel-src-pplanel-x/m.md\"}\n",
+            ),
+            ("no-trailing-newline.md", b"line one\n/Users/pplanel/src/pplanel/y"),
+            ("crlf.txt", b"/Users/pplanel/src/pplanel/a\r\nplain\r\n"),
+            ("untouched.json", b"{\"k\":\"nothing to replace\"}\n"),
+            (
+                "not-utf8.jsonl",
+                b"/Users/pplanel/src/pplanel/a\n\xff\xfe /Users/pplanel/src/pplanel/b\n",
+            ),
+            ("binary.png", b"/Users/pplanel/src/pplanel \xff\n"),
+        ];
+        for canon in [arrakis(), imperium()] {
+            for (rel, bytes) in cases {
+                let streamed = canon
+                    .hash_canonical(rel, std::io::Cursor::new(bytes))
+                    .unwrap();
+                let whole = blake3::hash(&canon.content_to_canonical(rel, bytes));
+                assert_eq!(streamed, whole, "{rel}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_hash_does_not_load_the_file() {
+        // A 16 MiB transcript where every line has a path to rewrite.
+        let line = r#"{"cwd":"/Users/pplanel/src/pplanel/shift-compute","m":"/Users/pplanel/src/pplanel/.claude/projects/-Users-pplanel-src-pplanel-shift-compute/x.md"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let mut contents = String::new();
+        while contents.len() < 16 << 20 {
+            contents.push_str(line);
+            contents.push('\n');
+        }
+        std::fs::write(&path, &contents).unwrap();
+        let size = contents.len();
+        drop(contents);
+
+        let canon = arrakis();
+        let whole = crate::heap::peak_during(|| {
+            let bytes = std::fs::read(&path).unwrap();
+            blake3::hash(&canon.content_to_canonical("big.jsonl", &bytes))
+        });
+        let streamed = crate::heap::peak_during(|| {
+            let file = std::fs::File::open(&path).unwrap();
+            canon.hash_canonical("big.jsonl", file).unwrap()
+        });
+        eprintln!("file {size} B: whole-file peak {whole} B, streamed peak {streamed} B");
+
+        assert!(whole > size, "the old way holds at least the whole file");
+        assert!(streamed < 64 << 10, "streaming holds a line, not the file");
     }
 
     #[test]
