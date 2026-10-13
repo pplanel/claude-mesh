@@ -85,7 +85,7 @@ usage:
   claude-mesh report [--since 1h] [--peer NAME] [--files]
                                         what recent rounds fetched, merged and couldn't do
                                         (from the journal; --since defaults to 24h)
-  claude-mesh repair [--dry-run] [--force] SESSION-ID
+  claude-mesh repair [--dry-run] [--force] SESSION-ID|PATH.jsonl
                                         put a transcript merged out of order back in time
                                         order, so `claude --resume` opens at its real end;
                                         refuses an open session, keeps a backup
@@ -333,17 +333,29 @@ fn repair(args: &[String]) -> i32 {
         }
     };
     let config = &node.host.config;
+    // A path picks one copy when the session id is under several projects
+    // (a session moved between projects keeps its old copy there).
+    let given = PathBuf::from(id);
+    let id = &given
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|_| given.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap_or_else(|| id.to_string());
     if sync::live_sessions(config).iter().any(|s| s == id) {
         eprintln!("claude-mesh: {id} is open on this Mac; close it first");
         return 1;
     }
-    let found: Vec<PathBuf> = std::fs::read_dir(config.join("projects"))
+    let found: Vec<PathBuf> = if given.is_file() {
+        vec![given.clone()]
+    } else {
+        std::fs::read_dir(config.join("projects"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|d| d.path().join(format!("{id}.jsonl")))
         .filter(|p| p.is_file())
-        .collect();
+        .collect()
+    };
     let [path] = found.as_slice() else {
         eprintln!("claude-mesh: {} transcripts named {id}.jsonl under {}", found.len(), config.join("projects").display());
         return 1;
