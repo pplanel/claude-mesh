@@ -511,3 +511,35 @@ fn rounds_are_journaled_and_reported() {
         last_round(&mesh, 0, "nowhere")
     );
 }
+
+#[test]
+fn the_latest_edit_wins_even_when_the_older_one_is_relayed() {
+    // caladan edits first, imperium after. arrakis pulls caladan's edit, then
+    // imperium pulls from arrakis alone: the copy it sees is caladan's older
+    // edit, and must lose to imperium's own.
+    let mesh = start();
+    let rel = "projects/-Users-pplanel/memory/note.md";
+    let edit = |i: usize, content: &str, secs: u64| {
+        write(&mesh.dirs[i], rel, content);
+        std::fs::File::options()
+            .write(true)
+            .open(mesh.dirs[i].join(rel))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+    edit(1, "from caladan\n", 1_700_000_100);
+    edit(2, "from imperium\n", 1_700_000_150);
+    let pull = |i: usize, from: usize| {
+        let peer = format!("{}=tcp:127.0.0.1:{}", HOSTS[from], mesh.ports[from]);
+        let st = command(&mesh, i, &["once"])
+            .env("CLAUDE_MESH_PEERS", peer)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    pull(0, 1);
+    assert_eq!(read(&mesh.dirs[0], rel), "from caladan\n");
+    pull(2, 0);
+    assert_eq!(read(&mesh.dirs[2], rel), "from imperium\n");
+}

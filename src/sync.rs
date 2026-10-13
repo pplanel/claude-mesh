@@ -28,7 +28,7 @@
 //! written here (`failed`) is logged and skipped, never the whole round.
 
 use crate::canon::Canon;
-use crate::merge::{Strategy, last_writer_wins, merge_jsonl, merge_line_union, strategy_for};
+use crate::merge::{Strategy, last_writer_wins, merge_jsonl, merge_line_union, merge_lines_3way, strategy_for};
 use crate::scan::{Manifest, Scanner, mtime_ms};
 use crate::wire::Peer;
 use serde::{Deserialize, Serialize};
@@ -200,7 +200,7 @@ pub fn sync_peer(
         }
         let ours = local.get(rel);
         if ours.is_some_and(|o| o.hash == theirs.hash) {
-            forget_peer_copy(peer_copies, rel);
+            settle_peer_copy(peer_copies, rel, scanner.read_canonical(rel).as_deref());
             seen.insert(rel.clone(), theirs.hash.clone());
             state.local.insert(rel.clone(), theirs.hash.clone());
             continue;
@@ -266,8 +266,12 @@ pub fn sync_peer(
             None => (remote_bytes.clone(), false),
             Some(mine) => {
                 let unchanged_here = ours.is_some_and(|o| state.local.get(rel) == Some(&o.hash));
+                let base = (strategy_for(rel) == Strategy::LineUnion)
+                    .then(|| std::fs::read(peer_copy_path(peer_copies, rel)).ok())
+                    .flatten();
                 resolve(
                     rel,
+                    base.as_deref(),
                     mine,
                     ours.map_or(0, |o| o.mtime),
                     &remote_bytes,
@@ -302,6 +306,12 @@ pub fn sync_peer(
                 return Ok(None);
             }
             write_local(canon, &local_rel, &path, local_bytes.as_deref(), &result)?;
+            // Their content keeps their time. Written with ours, a copy
+            // relayed through a third Mac would look newer than an edit
+            // made after it, and win the next last-writer-wins.
+            if result == remote_bytes {
+                set_mtime_ms(&path, theirs.mtime)?;
+            }
             Ok(Some(true))
         })();
         match written {
@@ -347,7 +357,9 @@ pub fn sync_peer(
         // session merged, or paths that read back differently in our layout),
         // ours can't be the base for the peer's next tail. Keep the peer's
         // copy for that; drop it once they're the same.
-        if rel.ends_with(".jsonl") {
+        if strategy_for(rel) == Strategy::LineUnion {
+            keep_peer_copy(peer_copies, rel, &remote_bytes);
+        } else if rel.ends_with(".jsonl") {
             if ours_now == remote_bytes {
                 forget_peer_copy(peer_copies, rel);
             } else {
@@ -462,7 +474,16 @@ fn keep_peer_copy(dir: &Path, rel: &str, bytes: &[u8]) {
     }
 }
 
-/// Drop the peer's copy of `rel`, if any (ours is the same now).
+/// When our copy and the peer's are the same: a jsonl needs no peer copy
+/// any more, a line-union file keeps it as the base of its next merge.
+fn settle_peer_copy(dir: &Path, rel: &str, same: Option<&[u8]>) {
+    match same {
+        Some(bytes) if strategy_for(rel) == Strategy::LineUnion => keep_peer_copy(dir, rel, bytes),
+        _ => forget_peer_copy(dir, rel),
+    }
+}
+
+/// Drop the peer's copy of `rel`, if any.
 fn forget_peer_copy(dir: &Path, rel: &str) {
     let _ = std::fs::remove_file(peer_copy_path(dir, rel));
 }
@@ -471,6 +492,7 @@ fn forget_peer_copy(dir: &Path, rel: &str) {
 /// our version lost a conflict (and should be kept as a copy).
 fn resolve(
     rel: &str,
+    base: Option<&[u8]>,
     mine: &[u8],
     my_mtime: u64,
     theirs: &[u8],
@@ -480,7 +502,13 @@ fn resolve(
     let as_text = |b: &[u8]| std::str::from_utf8(b).ok().map(str::to_string);
     match (strategy_for(rel), as_text(mine), as_text(theirs)) {
         (Strategy::Jsonl, Some(a), Some(b)) => (merge_jsonl(&a, &b).into_bytes(), false),
-        (Strategy::LineUnion, Some(a), Some(b)) => (merge_line_union(&a, &b).into_bytes(), false),
+        (Strategy::LineUnion, Some(a), Some(b)) => {
+            let merged = match base.and_then(|o| std::str::from_utf8(o).ok()) {
+                Some(o) => merge_lines_3way(o, &a, &b),
+                None => merge_line_union(&a, &b),
+            };
+            (merged.into_bytes(), false)
+        }
         _ if unchanged_here => (theirs.to_vec(), false),
         _ => {
             if last_writer_wins(my_mtime, mine, their_mtime, theirs) {
@@ -531,6 +559,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp: PathBuf = dir.join(format!(".claude-mesh-{}-{tag}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Set `path`'s modification time to `ms` milliseconds since the Unix epoch.
+fn set_mtime_ms(path: &Path, ms: u64) -> std::io::Result<()> {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    std::fs::File::options().write(true).open(path)?.set_modified(t)
 }
 
 /// Whether `path` was modified less than the active window before `now`.
@@ -627,15 +661,23 @@ mod tests {
 
     #[test]
     fn unchanged_local_takes_theirs_without_conflict() {
-        let (r, c) = resolve("plans/p.md", b"old", 5, b"new", 1, true);
+        let (r, c) = resolve("plans/p.md", None, b"old", 5, b"new", 1, true);
         assert_eq!((r.as_slice(), c), (&b"new"[..], false));
     }
 
     #[test]
     fn both_changed_newer_wins_and_loser_is_kept() {
-        let (r, c) = resolve("plans/p.md", b"mine", 1, b"theirs", 2, false);
+        let (r, c) = resolve("plans/p.md", None, b"mine", 1, b"theirs", 2, false);
         assert_eq!((r.as_slice(), c), (&b"theirs"[..], true));
-        let (r, c) = resolve("plans/p.md", b"mine", 3, b"theirs", 2, false);
+        let (r, c) = resolve("plans/p.md", None, b"mine", 3, b"theirs", 2, false);
         assert_eq!((r.as_slice(), c), (&b"mine"[..], false));
+    }
+
+    #[test]
+    fn an_index_unchanged_here_takes_their_edit() {
+        let stale = b"- [A](a.md) \xe2\x80\x94 one\n";
+        let edited = b"- [A](a.md) \xe2\x80\x94 one, edited\n";
+        let (r, c) = resolve("projects/k/memory/MEMORY.md", Some(stale), stale, 1, edited, 2, true);
+        assert_eq!((r.as_slice(), c), (&edited[..], false));
     }
 }

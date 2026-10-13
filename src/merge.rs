@@ -18,10 +18,16 @@ use std::collections::HashSet;
 ///
 /// * One is a prefix of the other (the usual case: a session moved Macs and
 ///   kept going) → the longer one.
-/// * They diverged → the shared prefix, then each side's new lines as a
-///   block, blocks ordered by their first timestamp (ties by content), with
-///   lines already present skipped. Claude's transcripts are trees linked by
-///   `parentUuid`, so two branches side by side are still a valid file.
+/// * They diverged, and one side's new lines are all in the other's → that
+///   other side (what an earlier merge produced, merged again).
+/// * Otherwise → the shared prefix, then both sides' new lines interleaved
+///   by time: at each step the next line of either side with the earlier
+///   `(timestamp, line)`, lines already present skipped. Each side keeps
+///   its own order, and a line without a timestamp counts as the time of
+///   the line before it, so it stays where it was written. Claude's
+///   transcripts are trees linked by `parentUuid`, so interleaved branches
+///   are still a valid file, and the newest line ends up last, where
+///   `claude --resume` looks for the end of the conversation.
 pub fn merge_jsonl(a: &str, b: &str) -> String {
     if a == b {
         return a.to_string();
@@ -36,22 +42,53 @@ pub fn merge_jsonl(a: &str, b: &str) -> String {
         return b.to_string();
     }
 
-    let (ra, rb) = (&la[common..], &lb[common..]);
-    let mut blocks = [ra, rb];
-    blocks.sort_by_key(|blk| (first_timestamp(blk), blk.join("\n")));
+    let (prefix, ra, rb) = (&la[..common], &la[common..], &lb[common..]);
+    let in_a: HashSet<&str> = ra.iter().copied().collect();
+    let in_b: HashSet<&str> = rb.iter().copied().collect();
+    // Strict inclusion only: two tails with the same lines in different
+    // orders would make `a` win one way round and `b` the other.
+    if in_b.len() < in_a.len() && in_b.is_subset(&in_a) {
+        return a.to_string();
+    }
+    if in_a.len() < in_b.len() && in_a.is_subset(&in_b) {
+        return b.to_string();
+    }
 
-    let mut seen: HashSet<&str> = la[..common].iter().copied().collect();
-    let mut out: Vec<&str> = la[..common].to_vec();
-    for blk in blocks {
-        for line in blk {
-            if seen.insert(line) {
-                out.push(line);
-            }
+    let since = prefix.iter().rev().find_map(|l| line_timestamp(l)).unwrap_or(i64::MIN);
+    let (ka, kb) = (keyed(ra, since), keyed(rb, since));
+    let mut seen: HashSet<&str> = prefix.iter().copied().collect();
+    let mut out: Vec<&str> = prefix.to_vec();
+    let (mut i, mut j) = (0, 0);
+    while i < ka.len() || j < kb.len() {
+        // Keys depend on the line alone, never on the side, so swapping
+        // `a` and `b` picks the same line at every step.
+        let from_a = match (ka.get(i), kb.get(j)) {
+            (Some(x), Some(y)) => x <= y,
+            (x, _) => x.is_some(),
+        };
+        let (_, line) = if from_a { i += 1; &ka[i - 1] } else { j += 1; &kb[j - 1] };
+        if seen.insert(line) {
+            out.push(line);
         }
     }
     let mut s = out.join("\n");
     s.push('\n');
     s
+}
+
+/// Each line with the key it's interleaved by: its timestamp, or the last
+/// one before it (starting from `since`, the shared prefix's last), then
+/// the line itself.
+fn keyed<'a>(tail: &[&'a str], since: i64) -> Vec<(i64, &'a str)> {
+    let mut last = since;
+    tail.iter()
+        .map(|line| {
+            if let Some(t) = line_timestamp(line) {
+                last = t;
+            }
+            (last, *line)
+        })
+        .collect()
 }
 
 /// Line-set files (`MEMORY.md`, the memory index): every line from both,
@@ -70,6 +107,25 @@ pub fn merge_line_union(a: &str, b: &str) -> String {
         }
     }
     // Collapse runs of blank lines a union can create.
+    out.dedup_by(|x, y| x.trim().is_empty() && y.trim().is_empty());
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// [`merge_line_union`] with a base, the peer's version we last merged:
+/// lines either side removed since the base are gone, so an edited entry
+/// (its old line removed, its new one added) leaves no stale copy and a
+/// removed one doesn't come back. Symmetric in `mine` and `theirs` for the
+/// same base.
+pub fn merge_lines_3way(base: &str, mine: &str, theirs: &str) -> String {
+    let (m, t): (HashSet<&str>, HashSet<&str>) = (lines(mine).into_iter().collect(), lines(theirs).into_iter().collect());
+    let removed: HashSet<&str> = lines(base)
+        .into_iter()
+        .filter(|l| !l.trim().is_empty() && (!m.contains(l) || !t.contains(l)))
+        .collect();
+    let union = merge_line_union(mine, theirs);
+    let mut out: Vec<&str> = lines(&union).into_iter().filter(|l| !removed.contains(l)).collect();
     out.dedup_by(|x, y| x.trim().is_empty() && y.trim().is_empty());
     let mut s = out.join("\n");
     s.push('\n');
@@ -111,23 +167,19 @@ fn lines(s: &str) -> Vec<&str> {
     s.lines().collect()
 }
 
-/// The `"timestamp":"…"` of the first line that has one, as text (ISO 8601
-/// strings sort chronologically); numeric timestamps (`history.jsonl`) are
-/// zero-padded so they sort too.
-fn first_timestamp(block: &[&str]) -> String {
-    for line in block {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match v.get("timestamp") {
-            Some(serde_json::Value::String(s)) => return s.clone(),
-            Some(serde_json::Value::Number(n)) => {
-                return format!("{:020}", n.as_u64().unwrap_or(0));
-            }
-            _ => {}
-        }
+/// A line's `"timestamp"` in milliseconds since the Unix epoch: an RFC 3339
+/// string (any fraction or offset, so `…:00Z`, `…:00.123Z` and `-03:00`
+/// compare by the instant, not by their text) or a number (`history.jsonl`,
+/// already in ms). `None` if the line isn't JSON or has no usable one.
+fn line_timestamp(line: &str) -> Option<i64> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match v.get("timestamp")? {
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.timestamp_millis()),
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        _ => None,
     }
-    String::new()
 }
 
 #[cfg(test)]
@@ -156,6 +208,61 @@ mod tests {
         // Merging again changes nothing.
         assert_eq!(merge_jsonl(&m1, &a), m1);
         assert_eq!(merge_jsonl(&m1, &b), m1);
+    }
+
+    fn ts(t: &str) -> String {
+        format!(r#"{{"timestamp":"2026-10-08T{t}:00.000Z"}}"#)
+    }
+
+    #[test]
+    fn diverged_lines_interleave_by_timestamp() {
+        let line = ts;
+        let base = line("10:00");
+        let a = format!("{base}\n{}\n{}\n", line("10:10"), line("10:40"));
+        let b = format!("{base}\n{}\n{}\n", line("10:20"), line("10:30"));
+        let want = ["10:00", "10:10", "10:20", "10:30", "10:40"]
+            .map(line)
+            .join("\n")
+            + "\n";
+        assert_eq!(merge_jsonl(&a, &b), want);
+        assert_eq!(merge_jsonl(&b, &a), want);
+    }
+
+    #[test]
+    fn timestamps_compare_by_instant_not_text() {
+        // As text, "10:00:00Z" sorts after "10:00:00.500Z" ('.' < 'Z'), and
+        // "07:30-03:00" (10:30 UTC) before "10:10Z".
+        let base = r#"{"timestamp":"2026-10-08T09:00:00Z"}"#;
+        let whole = r#"{"timestamp":"2026-10-08T10:00:00Z"}"#;
+        let half = r#"{"timestamp":"2026-10-08T10:00:00.500Z"}"#;
+        let ten = r#"{"timestamp":"2026-10-08T10:10:00Z"}"#;
+        let brt = r#"{"timestamp":"2026-10-08T07:30:00-03:00"}"#;
+        let a = [base, whole, brt].join("\n") + "\n";
+        let b = [base, half, ten].join("\n") + "\n";
+        let want = [base, whole, half, ten, brt].join("\n") + "\n";
+        assert_eq!(merge_jsonl(&a, &b), want);
+        assert_eq!(merge_jsonl(&b, &a), want);
+    }
+
+    #[test]
+    fn interleaving_is_idempotent() {
+        let a = [ts("10:00"), ts("10:10"), ts("10:40")].join("\n") + "\n";
+        let b = [ts("10:00"), ts("10:20"), ts("10:30")].join("\n") + "\n";
+        let m = merge_jsonl(&a, &b);
+        assert_eq!(merge_jsonl(&m, &a), m);
+        assert_eq!(merge_jsonl(&a, &m), m);
+        assert_eq!(merge_jsonl(&m, &b), m);
+        assert_eq!(merge_jsonl(&b, &m), m);
+    }
+
+    #[test]
+    fn a_line_without_timestamp_stays_after_its_predecessor() {
+        let plain = r#"{"type":"summary"}"#;
+        let a = [ts("10:00"), ts("10:10"), plain.into(), ts("10:40")].join("\n") + "\n";
+        let b = [ts("10:00"), ts("10:20")].join("\n") + "\n";
+        let want = [ts("10:00"), ts("10:10"), plain.into(), ts("10:20"), ts("10:40")].join("\n") + "\n";
+        assert_eq!(merge_jsonl(&a, &b), want);
+        assert_eq!(merge_jsonl(&b, &a), want);
     }
 
     #[test]
